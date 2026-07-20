@@ -47,6 +47,9 @@ except ImportError:
 
 KERNEL_NAME = "rmsnorm"
 
+# The small-N path derives its own block geometry and is not tuned.
+SMALL_N_THRESHOLD = 2048
+
 
 def _store_yscale(scale_copy_atom, yscale_div, index, val):
     r = fx.make_rmem_tensor(1, fx.Float32)
@@ -67,20 +70,24 @@ def _quant_dtype_max(dtype_str: str) -> float:
     raise ValueError(f"unsupported quant dtype: {dtype_str!r} (expected 'i8' or 'int8')")
 
 
-def build_rmsnorm_module(N: int, dtype_str: str, store_rstd: bool = False, eps: float = EPS):
-    if N <= 2048:
+def build_rmsnorm_module(
+    N: int, dtype_str: str, store_rstd: bool = False, eps: float = EPS, BLOCK_THREADS: int = BLOCK_THREADS
+):
+    if N <= SMALL_N_THRESHOLD:
         return _build_rmsnorm_large_m_small_n_module(N, dtype_str, store_rstd, eps)
 
     arch = get_rocm_arch()
     USE_HW_CVT_PK_BF16_F32 = (arch == "gfx950") or str(arch).startswith("gfx95")
 
+    # BLOCK_THREADS controls storage, tiling, and launch geometry.
     tile_cols = BLOCK_THREADS * VEC_WIDTH
     RED_SLOTS = max(1, (BLOCK_THREADS + WARP_SIZE - 1) // WARP_SIZE)
     elem_bits = 32 if dtype_str == "f32" else 16
+    _kernel_kwargs = {} if BLOCK_THREADS <= 256 else {"known_block_size": [BLOCK_THREADS, 1, 1]}
 
     SharedStorage = _make_reduction_storage(RED_SLOTS)
 
-    @flyc.kernel
+    @flyc.kernel(**_kernel_kwargs)
     def rmsnorm_kernel(
         Input: fx.Tensor,
         Gamma: fx.Tensor,
@@ -298,6 +305,22 @@ def build_rmsnorm_module(N: int, dtype_str: str, store_rstd: bool = False, eps: 
         )
 
     return launch_rmsnorm
+
+
+@flyc.jit
+def rmsnorm_direct(
+    Input: fx.Tensor,
+    Gamma: fx.Tensor,
+    Output: fx.Tensor,
+    m_in: fx.Int32,
+    N: fx.Constexpr[int],
+    dtype_str: fx.Constexpr[str],
+    BLOCK_THREADS: fx.Constexpr[int],
+    stream: fx.Stream = fx.Stream(None),
+):
+    """Specialize the existing RMSNorm factory through JIT Constexpr inputs."""
+    launch = build_rmsnorm_module(N, dtype_str, BLOCK_THREADS=BLOCK_THREADS)
+    launch(Input, Gamma, Output, m_in, stream)
 
 
 def _build_rmsnorm_large_m_small_n_module(N: int, dtype_str: str, store_rstd: bool = False, eps: float = EPS):
