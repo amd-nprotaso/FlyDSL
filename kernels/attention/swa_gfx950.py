@@ -3,15 +3,15 @@
 #
 # Each of the 8 waves independently computes attention for its own 32-row Q tile.
 
-import torch
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl
-from flydsl.expr.typing import Vector as Vec, T
-from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.utils.arith import _to_raw as _raw
 
 MFMA_MASK = 0x08
 VALU_MASK = 0x02
@@ -42,14 +42,14 @@ def build_gqa_attn(
         assert swa_left >= 0 and swa_right >= 0, "sliding_window (LEFT, RIGHT) must be >= 0"
         _q_rows_per_cta = Q_BLOCK_SIZE * NUM_WARPS
         _span = swa_left + (_q_rows_per_cta - 1) + swa_right
-        _nt = -(-(_span + KV_BLOCK_SIZE) // KV_BLOCK_SIZE)   # 
+        _nt = -(-(_span + KV_BLOCK_SIZE) // KV_BLOCK_SIZE)  #
         NT_BAND = max(4, ((_nt + 3) // 4) * 4)
     else:
         swa_left = swa_right = None
         NT_BAND = None
 
     NUM_THREADS = WARP_SIZE * NUM_WARPS
-    
+
     D = ATTN_D
 
     if D == 128:
@@ -58,8 +58,8 @@ def build_gqa_attn(
         TEMPERATURE_SCALE = 0.125 * 1.44269504089
 
     BYTES_PER_THREAD = 16
-    BYTES_PER_WARP = BYTES_PER_THREAD * WARP_SIZE          # 1024
-    BYTES_PER_MEMCPY = BYTES_PER_THREAD * NUM_THREADS      # 8192
+    BYTES_PER_WARP = BYTES_PER_THREAD * WARP_SIZE  # 1024
+    BYTES_PER_MEMCPY = BYTES_PER_THREAD * NUM_THREADS  # 8192
 
     _LDS_TILE_ELEMS = KV_BLOCK_SIZE * ATTN_D
 
@@ -127,9 +127,7 @@ def build_gqa_attn(
         _mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(32, 32, 16, bf16))
 
         def mfma(a_v8, b_v8, c_v16):
-            return fly.mma_atom_call_ssa(
-                [v16f32_t], _mma_atom, _raw(a_v8), _raw(b_v8), _raw(c_v16)
-            )
+            return fly.mma_atom_call_ssa([v16f32_t], _mma_atom, _raw(a_v8), _raw(b_v8), _raw(c_v16))
 
         # ---------------- prefill offsets ----------------
         def prefill_offsets(is_k, row_stride):
@@ -140,11 +138,7 @@ def build_gqa_attn(
             ST_PER_ROW = 128 // ST_COLS
             offs = []
             for i in range_constexpr(2):
-                lane_byte_off = (
-                    lid * BYTES_PER_THREAD
-                    + wid * BYTES_PER_WARP
-                    + i * NUM_WARPS * BYTES_PER_WARP
-                )
+                lane_byte_off = lid * BYTES_PER_THREAD + wid * BYTES_PER_WARP + i * NUM_WARPS * BYTES_PER_WARP
                 subtile_id = lane_byte_off // ST_BYTES
                 subtile_row = subtile_id // ST_PER_ROW
                 subtile_col = subtile_id % ST_PER_ROW
@@ -179,9 +173,7 @@ def build_gqa_attn(
             soff_elems = base_elems + tile * (KV_BLOCK_SIZE * row_stride)
             soff_elems = sgpr(soff_elems)
             for i in range_constexpr(2):
-                lds_ptr = fx.inttoptr(
-                    _lds_dma_ptr_ty, i32(lds_base + i32(i * BYTES_PER_MEMCPY))
-                )
+                lds_ptr = fx.inttoptr(_lds_dma_ptr_ty, i32(lds_base + i32(i * BYTES_PER_MEMCPY)))
                 dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
                 src = fx.slice(src_div, (None, i32(offsets[i])))
                 fx.copy(_dma_atom, src, dst, soffset=i32(soff_elems))
@@ -369,9 +361,7 @@ def build_gqa_attn(
         # block instead of drifting up into the previous compute block (which
         # forced the compiler to insert conservative vmcnt(3/5/6) drains).
         def nop_anchor():
-            _llvm.inline_asm(
-                ir.Type.parse("!llvm.void"), [], "s_nop 7", "", has_side_effects=True
-            )
+            _llvm.inline_asm(ir.Type.parse("!llvm.void"), [], "s_nop 7", "", has_side_effects=True)
 
         # Value anchors (mirror flash_attn_gfx950.py _anchor_v_o / _anchor_v_p): a
         # no-op inline-asm that reads and re-defines the values in place (identity
@@ -424,11 +414,7 @@ def build_gqa_attn(
 
         def wait_vmcnt(n):
             # vmcnt(n) only; leave lgkmcnt/expcnt maxed (no wait on those).
-            val = (
-                (n & _VMCNT_LO_MASK)
-                | _LGKMCNT_EXPCNT_BASE
-                | (((n >> 4) & _VMCNT_HI_MASK) << _VMCNT_HI_SHIFT)
-            )
+            val = (n & _VMCNT_LO_MASK) | _LGKMCNT_EXPCNT_BASE | (((n >> 4) & _VMCNT_HI_MASK) << _VMCNT_HI_SHIFT)
             rocdl.s_waitcnt(val)
 
         def wait_lgkmcnt0():
@@ -470,7 +456,7 @@ def build_gqa_attn(
         v_lds_base = [_lds_base(v_smem_0), _lds_base(v_smem_1)]
 
         if const_expr(NT_BAND is not None):
-            qs = block_tile_idx * i32(Q_BLOCK_SIZE * NUM_WARPS)   # first q row of CTA
+            qs = block_tile_idx * i32(Q_BLOCK_SIZE * NUM_WARPS)  # first q row of CTA
             left_edge = qs - i32(swa_left)
             left_edge = (left_edge > i32(0)).select(left_edge, i32(0))
             right_edge = qs + i32((Q_BLOCK_SIZE * NUM_WARPS - 1) + swa_right)
@@ -506,11 +492,7 @@ def build_gqa_attn(
 
             q_row = i32(tile_idx * i32(Q_BLOCK_SIZE)) + i32(lid % 32)
 
-            kcol_base = (
-                base_kv_row
-                + i32(band_tile) * i32(KV_BLOCK_SIZE)
-                + i32((lid // 32) * 4)
-            )
+            kcol_base = base_kv_row + i32(band_tile) * i32(KV_BLOCK_SIZE) + i32((lid // 32) * 4)
 
             width = fx.Uint32(swa_left + swa_right)
             out = [None, None]
@@ -518,12 +500,7 @@ def build_gqa_attn(
             for h in range_constexpr(2):
                 src = Vec(att[h])
                 elems = []
-                rel_base = (
-                    kcol_base
-                    + i32(32 * h)
-                    - q_row
-                    + i32(swa_left)
-                )
+                rel_base = kcol_base + i32(32 * h) - q_row + i32(swa_left)
 
                 for r in range_constexpr(16):
                     c = 8 * (r // 4) + (r % 4)
@@ -584,19 +561,18 @@ def build_gqa_attn(
             + tile_idx * (Q_BLOCK_SIZE * ATTN_H * ATTN_D)
             + head_idx * ATTN_D
         )
-        
+
         def _concat(lhs, rhs):
-            lv = Vec(lhs); rv = Vec(rhs)
+            lv = Vec(lhs)
+            rv = Vec(rhs)
             return lv.shuffle(rv, list(range(lv.numel)) + [lv.numel + i for i in range(rv.numel)])
 
         q_raw = [None] * 8
         for j in range_constexpr(8):
             col = 16 * j + q_col_offset
             elem_off = q_base + q_row_offset * Q_stride1 + col
-            q_raw[j] = fly.copy_atom_call_ssa(
-                [v8bf16_t], _q_load_atom, fx.slice(q_div, (None, i32(elem_off)))
-            )
-        
+            q_raw[j] = fly.copy_atom_call_ssa([v8bf16_t], _q_load_atom, fx.slice(q_div, (None, i32(elem_off))))
+
         rocdl.sched_barrier(0)
         wait_vmcnt(0)
         rocdl.sched_barrier(0)
@@ -636,8 +612,11 @@ def build_gqa_attn(
         att_block[0] = mask_band(att_block[0], 0)
 
         # ---------------- Partial softmax for QK[0] ----------------
-        max_vec = fx.Float32(fmaxf(col_max(att_block[0]), NEG_FLOOR)) if const_expr(NT_BAND is not None) \
+        max_vec = (
+            fx.Float32(fmaxf(col_max(att_block[0]), NEG_FLOOR))
+            if const_expr(NT_BAND is not None)
             else fx.Float32(col_max(att_block[0]))
+        )
         max_vec_prev = max_vec
         att_block[0] = sub_col(att_block[0], max_vec)
         att_block[0][0] = exp2_one(att_block[0][0])
@@ -678,7 +657,7 @@ def build_gqa_attn(
         def rescale_defer(att_buf, o_reg, max_prev, scale_old, packs):
             m_cur = col_max(att_buf)
             if const_expr(NT_BAND is not None):
-                m_cur = fmaxf(m_cur, NEG_FLOOR)   # tile fully out of band -> -inf
+                m_cur = fmaxf(m_cur, NEG_FLOOR)  # tile fully out of band -> -inf
             m_new = fmaxf(m_cur, max_prev)
             with arith.fastmath(fm):
                 delta = fx.Float32(m_new) - fx.Float32(max_prev)
@@ -719,11 +698,14 @@ def build_gqa_attn(
             for i in range_constexpr(2):
                 for jj in range_constexpr(8):
                     flat.append(k_reg[i][jj])
-            flat.append(att0[0]); flat.append(att0[1])
+            flat.append(att0[0])
+            flat.append(att0[1])
             for n in range_constexpr(4):
                 flat.append(o_reg[n])
-            flat.append(max_vec_prev); flat.append(norm_vec)
-            flat.append(scale_vec); flat.append(pending_scale)
+            flat.append(max_vec_prev)
+            flat.append(norm_vec)
+            flat.append(scale_vec)
+            flat.append(pending_scale)
             return flat
 
         def _unflatten(flat):
@@ -731,15 +713,21 @@ def build_gqa_attn(
             k_reg = [[None] * 8 for _ in range_constexpr(2)]
             for i in range_constexpr(2):
                 for jj in range_constexpr(8):
-                    k_reg[i][jj] = flat[p]; p += 1
-            att0 = [flat[p], flat[p + 1]]; p += 2
-            o_reg = [flat[p + n] for n in range_constexpr(4)]; p += 4
-            max_vec_prev = fx.Float32(flat[p]); p += 1
-            norm_vec = fx.Float32(flat[p]); p += 1
-            scale_vec = fx.Float32(flat[p]); p += 1
-            pending_scale = flat[p]; p += 1
+                    k_reg[i][jj] = flat[p]
+                    p += 1
+            att0 = [flat[p], flat[p + 1]]
+            p += 2
+            o_reg = [flat[p + n] for n in range_constexpr(4)]
+            p += 4
+            max_vec_prev = fx.Float32(flat[p])
+            p += 1
+            norm_vec = fx.Float32(flat[p])
+            p += 1
+            scale_vec = fx.Float32(flat[p])
+            p += 1
+            pending_scale = flat[p]
+            p += 1
             return k_reg, att0, o_reg, max_vec_prev, norm_vec, scale_vec, pending_scale
-
 
         def _run_body(j, k_reg, att0, o_reg, max_vec_prev, norm_vec, scale_vec, pending_scale):
             jm1 = j - 1
@@ -769,7 +757,7 @@ def build_gqa_attn(
             rocdl.sched_barrier(0)
             load_k(j, 1)
             v_reg = load_v_regs(0)
-            att1 = mask_band(att1, jm1 - 1)   # k_reg held band tile j-2 in block 0
+            att1 = mask_band(att1, jm1 - 1)  # k_reg held band tile j-2 in block 0
             wait_lgkmcnt0()
             wait_vmcnt(4)
             rocdl.sched_barrier(0)
@@ -780,7 +768,8 @@ def build_gqa_attn(
             rocdl.s_setprio(1)
             o_reg = mma_AtB_OV_slice(o_reg, v_reg[0], att_block_bf16[0])
             o_reg, scale_vec, pending_scale, max_vec, att_block_bf16 = rescale_defer(
-                att1, o_reg, max_vec_prev, scale_vec, att_block_bf16)
+                att1, o_reg, max_vec_prev, scale_vec, att_block_bf16
+            )
             o_reg = anchor_o(o_reg)
             max_vec_prev = max_vec
             sched_pairs(4, 6, 2)
@@ -831,7 +820,7 @@ def build_gqa_attn(
             rocdl.sched_barrier(0)
             load_k(jp1, 0)
             v_reg = load_v_regs(1)
-            att0 = mask_band(att0, jm1)   # k_reg held band tile j-1 in block 4
+            att0 = mask_band(att0, jm1)  # k_reg held band tile j-1 in block 4
             wait_lgkmcnt0()
             wait_vmcnt(4)
             rocdl.sched_barrier(0)
@@ -842,7 +831,8 @@ def build_gqa_attn(
             rocdl.s_setprio(1)
             mma_AtB_OV_slice(o_reg, v_reg[0], att_block_bf16[0])
             o_reg, scale_vec, pending_scale, max_vec, att_block_bf16 = rescale_defer(
-                att0, o_reg, max_vec_prev, scale_vec, att_block_bf16)
+                att0, o_reg, max_vec_prev, scale_vec, att_block_bf16
+            )
             o_reg = anchor_o(o_reg)
             max_vec_prev = max_vec
             sched_pairs(4, 6, 4)
@@ -869,11 +859,9 @@ def build_gqa_attn(
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
-            return (k_reg, att0, o_reg, max_vec_prev, norm_vec, scale_vec,
-                    pending_scale)
+            return (k_reg, att0, o_reg, max_vec_prev, norm_vec, scale_vec, pending_scale)
 
-        init_flat = _flatten(k_reg, att_block[0], o_reg, max_vec_prev,
-                             norm_vec, scale_vec, pending_scale)
+        init_flat = _flatten(k_reg, att_block[0], o_reg, max_vec_prev, norm_vec, scale_vec, pending_scale)
         # Unroll x2 over a runtime range(..., init=) loop: driver steps j by 4,
         # body runs tiles (j, j+1) then (j+2, j+3). The i32 DSL bounds keep this a
         # runtime scf.for (Python-int bounds would trigger constexpr unrolling), and
@@ -886,8 +874,7 @@ def build_gqa_attn(
                 j = j0 + i32(2 * u)
                 state = _run_body(j, *state)
             loop_results = yield _flatten(*state)
-        (k_reg, att_block[0], o_reg, max_vec_prev, norm_vec, scale_vec,
-         pending_scale) = _unflatten(loop_results)
+        k_reg, att_block[0], o_reg, max_vec_prev, norm_vec, scale_vec, pending_scale = _unflatten(loop_results)
 
         # ====================================================================
         # (no lazy-threshold vote): every tile rescales o_reg/norm by exp2(prev-new).
@@ -914,7 +901,7 @@ def build_gqa_attn(
             for jj in range_constexpr(8):
                 k_reg_t[jj][i] = k_reg[i][jj]
         att_block[1] = mma_AtB_QK(k_reg_t, q_reg_t, att_block[1])
-        
+
         if pending_scale:
             norm_vec = fmul(norm_vec, scale_vec)
         att_block_bf16, norm_vec = finish_scalar(att_block[0][0], att_block[0][1], norm_vec)
@@ -1068,9 +1055,9 @@ def build_gqa_attn(
 
         # ---- Block 12: Final A*V and normalize ----
         o_reg = mma_AtB_OV(o_reg, v_reg, att_block_bf16)
-        
+
         inv = rocdl.rcp(T.f32, norm_vec)
-        # Guard against a fully-masked row (norm == 0 -> rcp == inf). 
+        # Guard against a fully-masked row (norm == 0 -> rcp == inf).
         if const_expr(NT_BAND is not None):
             inv = arith.select(fx.Float32(norm_vec) > 0.0, inv, 0.0)
         o_reg = mul_o(o_reg, inv)
@@ -1083,7 +1070,6 @@ def build_gqa_attn(
             rocdl.s_barrier()
 
         store_o(o_reg)
-
 
     @flyc.jit
     def launch(
@@ -1104,8 +1090,16 @@ def build_gqa_attn(
         grid_y = (fx.Int32(seq_len_q) // fx.Int32(Q_BLOCK_SIZE) + fx.Int32(NUM_WARPS - 1)) // fx.Int32(NUM_WARPS)
         grid_z = ATTN_B
         attend_ker(
-            Q, K, V, O,
-            Q_stride1, K_stride1, V_stride1, O_stride1, seq_len_q, seq_len_kv,
+            Q,
+            K,
+            V,
+            O,
+            Q_stride1,
+            K_stride1,
+            V_stride1,
+            O_stride1,
+            seq_len_q,
+            seq_len_kv,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu,
                 "rocdl.flat_work_group_size": f"{NUM_THREADS},{NUM_THREADS}",
