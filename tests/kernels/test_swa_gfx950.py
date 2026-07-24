@@ -77,9 +77,7 @@ def _run_swa(B, N, left, right, seed=0):
     v = torch.randn(B, N, H_KV, D, dtype=DTYPE, device="cuda")
     out = torch.zeros(B, N, H, D, dtype=DTYPE, device="cuda")
 
-    launch = build_gqa_attn(
-        ATTN_B=B, ATTN_H=H, ATTN_H_KV=H_KV, ATTN_D=D, sliding_window=(left, right)
-    )
+    launch = build_gqa_attn(ATTN_B=B, ATTN_H=H, ATTN_H_KV=H_KV, ATTN_D=D, sliding_window=(left, right))
     stream = torch.cuda.current_stream()
     args = (
         q.reshape(-1),
@@ -101,13 +99,8 @@ def _run_swa(B, N, left, right, seed=0):
     ref = _ref_fp32(q, k, v, left, right)
     o_f32 = out.float()
     max_err = (ref - o_f32).abs().max().item()
-    cos = torch.nn.functional.cosine_similarity(
-        ref.flatten(), o_f32.flatten(), dim=0
-    ).item()
-    print(
-        f"\n[swa_gfx950] B={B} N={N} win=({left},{right}) "
-        f"cos={cos:.6f} max_abs={max_err:.4f}"
-    )
+    cos = torch.nn.functional.cosine_similarity(ref.flatten(), o_f32.flatten(), dim=0).item()
+    print(f"\n[swa_gfx950] B={B} N={N} win=({left},{right}) cos={cos:.6f} max_abs={max_err:.4f}")
     assert cos > 0.999, f"cosine {cos:.6f} <= 0.999 (max_abs={max_err:.4f})"
 
 
