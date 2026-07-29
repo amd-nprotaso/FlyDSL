@@ -13,10 +13,15 @@ the hand-written reference asm (num_records bound on Q/K/V/O, tile count rounded
 up to even, and a kv padding-mask on the non-causal path).
 """
 
+import math as host_math
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import fly
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import math as fmath
+from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from kernels.attention.flash_attn_utils import (
     DualwaveGemmHelper,
@@ -40,6 +45,8 @@ from kernels.attention.flash_attn_utils import (
     _sched_barrier,
     _sched_barrier_exp_pairs,
     _sched_barrier_pairs,
+    _seq_pad_col_base,
+    _seq_pad_score_threshold,
     _stagger_extra_barrier_if_one,
     _stagger_extra_barrier_if_zero,
     _v_pair_to_vec32,
@@ -67,13 +74,20 @@ def build_flash_attn_dualwave_swp_module(
     paged=False,
     kv_cache_layout="linear",
     return_lse=False,
+    has_bias=False,
+    has_alibi=False,
 ):
     """Build an DUALWAVE_SWP flash_attn launcher for D=64/128 bf16/f16 on gfx950.
 
     Supports dense self-attention, varlen packed QKV, and paged-KV cache modes.
     Varlen uses cu_seqlens_q/kv with per-batch self-attention ranges.
     Paged mode keeps Q/O dense and maps KV tiles through BlockTable pages.
-    Varlen, paged, and split-K are mutually constrained by the caller."""
+    Varlen, paged, and split-K are mutually constrained by the caller.
+    has_bias adds a dense elementwise attention bias and works on both the dense
+    and varlen paths; see the HAS_BIAS block below for the per-mode shapes.
+    has_alibi adds a per-head ALiBi positional bias computed analytically from a
+    slope table; see the HAS_ALIBI block below. The two are independent and may
+    be enabled together."""
     gpu_arch = get_hip_arch()
 
     if not gpu_arch.startswith("gfx950"):
@@ -98,6 +112,45 @@ def build_flash_attn_dualwave_swp_module(
         raise ValueError("vectorized layout requires HEAD_DIM and PageSize divisible by kVS")
     if VARLEN and SPLITK:
         raise ValueError("varlen is not supported together with num_kv_splits > 1")
+    # Attention bias, matching aiter's contract in both Q modes:
+    #   dense:  (seq_len, seq_len_kv), broadcast over batch and head. Row = the
+    #           per-batch q_row, so every batch reads the same matrix.
+    #   varlen: (total_q, max_seqlen_kv), broadcast over head only. Row = the
+    #           *global* packed q token (cu_seqlens_q[b] + q_row), column = the
+    #           per-batch-local k_col -- i.e. batch b owns rows
+    #           [cu_seqlens_q[b], cu_seqlens_q[b+1]) and columns [0, seqlen_kv[b]).
+    # Orthogonal to paging and split-K, both of which are supported here:
+    #   paged   page_size == BLOCK_N and the block table is indexed by tile index,
+    #           so tile j always covers logical KV [j*BLOCK_N, (j+1)*BLOCK_N).
+    #           Paging redirects where KV *data* is fetched, never the bias column.
+    #   split-K each split folds the bias over its own absolute tile range; the
+    #           combine pass merges already-biased partials. Every add_score_bias call
+    #           site must therefore pass an absolute (split_t0-relative) tile index.
+    HAS_BIAS = bool(has_bias)
+    # ALiBi, matching aiter's contract (ck-tile block_position_encoding.hpp):
+    #   AlibiSlopes is fp32, (num_heads,) or (batch, num_heads), values positive,
+    #   and the score gets
+    #       -slope * |q_row + seq_len_kv - seq_len_q - k_col|
+    #   added *after* the 1/sqrt(D) scaling (the slope is NOT divided by it).
+    # The (seq_len_kv - seq_len_q) term is exactly ctx.delta_i32, i.e. the same
+    # bottom-right alignment the causal mask already uses, so ALiBi and the mask
+    # measure position identically.
+    #
+    # Because the distance is an *absolute* value, the q_row term does not cancel
+    # in the softmax and must be carried (a signed ALiBi could drop it). Under
+    # pure causal, aiter instead adds +slope*k_col, which differs from the form
+    # above only by a per-row constant: outputs are identical, only LSE differs.
+    # We keep the general form, so LSE stays the mathematically correct one.
+    #
+    # Orthogonal to every Q mode and KV source, like HAS_BIAS: k_col is the
+    # logical column (paging redirects data, not columns), q_row/k_col are
+    # per-batch-local, and split-K passes absolute tile indices. Note ALiBi wants
+    # the *within-sequence* q position, so unlike the loaded bias it must not add
+    # the packed-token base q_tok_base on the varlen path.
+    HAS_ALIBI = bool(has_alibi)
+    # log2(e): scores already carry 1/sqrt(D)*log2(e) from DualwaveQLoader.scale_all,
+    # so the bias only needs the log2(e) factor to land in the same exp2 space.
+    BIAS_LOG2E = host_math.log2(host_math.e)
 
     traits = _make_dualwave_swp_traits(
         num_heads,
@@ -120,7 +173,9 @@ def build_flash_attn_dualwave_swp_module(
         return_lse=return_lse,
     )
     traits.BLOCK_N_OUT // traits.BLOCK_N
-    _dualwave_swp_cache_tag = traits.cache_tag
+    # HAS_BIAS/HAS_ALIBI are not part of traits.cache_tag, so fold them in here:
+    # otherwise builds differing only in these flags alias in the JIT cache.
+    _dualwave_swp_cache_tag = (traits.cache_tag, HAS_BIAS, HAS_ALIBI)
 
     # Shared-memory layout: one 16B-aligned K/V region (K0/V0/K1/V1).
     _lds_elem_dtype = dtype_to_elem_type(traits.DTYPE_STR)
@@ -149,12 +204,16 @@ def build_flash_attn_dualwave_swp_module(
         CuSeqQ: fx.Tensor,
         CuSeqKv: fx.Tensor,
         BlockTable: fx.Tensor,
+        Bias: fx.Tensor,
+        AlibiSlopes: fx.Tensor,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
         stride_kv_n: fx.Int32,
         head_dim_runtime: fx.Int32,
         block_table_stride: fx.Int32,
+        bias_stride0: fx.Int32,
+        alibi_stride_b: fx.Int32,
     ):
         ctx = DualwaveKernelContext(
             traits,
@@ -203,6 +262,123 @@ def build_flash_attn_dualwave_swp_module(
         gemm_helper = DualwaveGemmHelper(ctx)
         softmax_helper = DualwaveSoftmaxHelper(ctx)
 
+        # ---------------- attention bias ----------------
+        if const_expr(HAS_BIAS):
+            _bias_div = fx.logical_divide(fx.rocdl.make_buffer_tensor(Bias), fx.make_layout(1, 1))
+            # Score elements are contiguous in k_col in runs of BIAS_VEC, so one
+            # run is one vector load. The vectorized KV layout swizzles the score
+            # tile into runs of 8 (128b) instead of 4 (64b) -- see
+            # _seq_pad_score_threshold, which the masks use on the same columns.
+            if const_expr(traits.KV_VECTORIZED):
+                _BIAS_VEC = 8
+                _bias_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), ctx.elem_dtype)
+            else:
+                _BIAS_VEC = 4
+                _bias_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), ctx.elem_dtype)
+            _BIAS_GROUPS = 16 // _BIAS_VEC
+            _bias_vec_ty = Vec.make_type(_BIAS_VEC, ctx.elem_dtype)
+            _bias_log2e = fx.Float32(BIAS_LOG2E)
+            # Varlen packs every batch's rows into one (total_q, max_seqlen_kv)
+            # matrix, so this batch's rows start at cu_seqlens_q[b]. Dense
+            # broadcasts one matrix over batch, so its row base is 0 and the
+            # term folds away at build time.
+            _bias_row_base_i32 = fx.Int32(ctx.q_tok_base) if const_expr(VARLEN) else None
+
+        # ---------------- ALiBi ----------------
+        if const_expr(HAS_ALIBI):
+            _alibi_div = fx.logical_divide(fx.rocdl.make_buffer_tensor(AlibiSlopes), fx.make_layout(1, 1))
+            _alibi_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+            _alibi_v1f32 = Vec.make_type(1, fx.Float32)
+            # One fp32 slope per (batch, q head), wave-uniform. Indexed by the
+            # GQA-swizzled ctx.q_head_idx -- the same head index Q itself is
+            # addressed by -- so GQA groups pick up their own slope. A 1D
+            # (num_heads,) table is broadcast over batch by passing stride 0.
+            _alibi_idx_i32 = fx.Int32(ctx.batch_idx) * fx.Int32(alibi_stride_b) + fx.Int32(ctx.q_head_idx)
+            _alibi_raw = fly.copy_atom_call_ssa(
+                [_alibi_v1f32],
+                _alibi_atom,
+                fx.slice(_alibi_div, (None, _alibi_idx_i32)),
+            )
+            # Fold the negation (aiter takes positive slopes and negates internally)
+            # and log2(e) in once, so each score element costs a single fma.
+            _alibi_neg_slope = Vec(_alibi_raw, (1,), fx.Float32)[0] * fx.Float32(-BIAS_LOG2E)
+
+        def _score_bias_half(s_h, tile_idx, h):
+            """Fold the bias and/or ALiBi into one 32-column half of a score tile.
+
+            Score layout, built from the same _seq_pad_col_base /
+            _seq_pad_score_threshold helpers the padding mask uses, so bias, ALiBi
+            and mask agree on every column by construction:
+                q_row = q_start + wave*ROWS_PER_WAVE + lane%32          (ctx.q_row)
+                k_col = _seq_pad_col_base(tile, lane//32) + 32*h
+                        + _seq_pad_score_threshold(r)
+
+            Both q_row and k_col are per-batch-local (the Q/K/V descriptors are
+            rebased per batch). Paging leaves k_col alone -- it only redirects
+            which page the KV data comes from.
+            """
+            # ctx.q_row_i32 is only set by ctx.init_q_row(), which DualwaveQLoader
+            # .load_all() runs inside _main_body -- so the row term is built here
+            # rather than hoisted to helper-construction time. It is lane-invariant,
+            # so the compiler CSEs it across the six folds.
+            col_base_h = _seq_pad_col_base(traits, tile_idx, lane_div_32=ctx.lane_div_32) + fx.Int32(32 * h)
+            src = Vec(s_h)
+            out = [src[r] for r in range_constexpr(16)]
+
+            if const_expr(HAS_ALIBI):
+                # Distance to the bottom-right-aligned diagonal, at score row r == 0;
+                # element r sits _seq_pad_score_threshold(r) columns further right.
+                # ctx.delta_i32 (= seq_len_kv - seq_len_q, per batch under varlen) is
+                # the same alignment term the causal mask uses. ALiBi measures the
+                # position *within* the sequence, so unlike the loaded bias below it
+                # never adds the varlen packed-token base.
+                rel0 = fx.Float32(ctx.q_row_i32 + ctx.delta_i32 - col_base_h)
+                for r in range_constexpr(16):
+                    d = rel0 - fx.Float32(float(_seq_pad_score_threshold(traits, r)))
+                    # absf lowers to a VOP3 abs source modifier, so the absolute
+                    # distance is free: one sub plus one fma per score element, and
+                    # no memory traffic at all.
+                    out[r] = fmath.fma(fmath.absf(d), _alibi_neg_slope, out[r], fastmath=ctx.fm_fast)
+
+            if const_expr(HAS_BIAS):
+                # Score elements are contiguous in k_col in runs of BIAS_VEC, so each
+                # group g is one vector load at the group's threshold offset.
+                # Out-of-range reads return 0 through the buffer descriptor and are
+                # masked away downstream. Varlen packs every batch's rows into one
+                # matrix, so the row needs the packed-token base added.
+                bias_row_i32 = ctx.q_row_i32
+                if const_expr(VARLEN):
+                    bias_row_i32 = bias_row_i32 + _bias_row_base_i32
+                base = bias_row_i32 * fx.Int32(bias_stride0) + col_base_h
+                for g in range_constexpr(_BIAS_GROUPS):
+                    col_off = _seq_pad_score_threshold(traits, g * _BIAS_VEC)
+                    raw = fly.copy_atom_call_ssa(
+                        [_bias_vec_ty],
+                        _bias_atom,
+                        fx.slice(_bias_div, (None, base + fx.Int32(col_off))),
+                    )
+                    # Widen one group at a time: widening all 16 up front keeps a 16-VGPR
+                    # temporary live and measured ~12% slower on the sibling SWA kernel.
+                    bv = Vec(Vec(raw, (_BIAS_VEC,), ctx.elem_dtype).to(fx.Float32))
+                    for e in range_constexpr(_BIAS_VEC):
+                        r = g * _BIAS_VEC + e
+                        out[r] = fmath.fma(bv[e], _bias_log2e, out[r], fastmath=ctx.fm_fast)
+
+            return Vec.from_elements(out, fx.Float32).ir_value()
+
+        def add_score_bias(v_s, tile_idx):
+            """Add the bias and/or ALiBi to a QK score pair, before any masking.
+
+            Added after the QK MFMAs rather than seeded into the MFMA accumulator.
+            For the loaded bias, seeding is free in principle but puts the load ahead
+            of the MFMA chain instead of under it, and measured ~18% slower on the
+            sibling SWA kernel. For ALiBi the fma already absorbs the accumulate, so
+            seeding would not save an instruction either.
+            """
+            if const_expr(not (HAS_BIAS or HAS_ALIBI)):
+                return v_s
+            return (_score_bias_half(v_s[0], tile_idx, 0), _score_bias_half(v_s[1], tile_idx, 1))
+
         def _main_body():
             # Paged: stage the block-table row into LDS before any page-id ds_read.
             if const_expr(traits.PAGED):
@@ -250,6 +426,9 @@ def build_flash_attn_dualwave_swp_module(
             if const_expr(traits.PAGED):
                 pro_pageid_2_lds = page_ids.load_page_id_lds(page_ids.split_tile(2))
             v_s_0 = gemm_helper.qk(v_k, q_all_scaled_bf16)
+            # Absolute tile index, like every other add_score_bias site: under split-K this
+            # split's prologue tile is split_t0, not 0. Folds to 0 when not SPLITK.
+            v_s_0 = add_score_bias(v_s_0, ctx.split_tile(0))
             _sched_barrier(0)
 
             if const_expr(traits.CAUSAL):
@@ -327,6 +506,7 @@ def build_flash_attn_dualwave_swp_module(
                 if const_expr(traits.PAGED):
                     c2_pageid_lds = page_ids.load_page_id_lds(j_idx)
                 v_s_1 = gemm_helper.qk(v_k, q_all_scaled_bf16)
+                v_s_1 = add_score_bias(v_s_1, j_idx - 2)
                 v_p_0 = softmax_helper.exp2(v_p_0, 16, 16)
                 l_row = softmax_helper.reduce_sum(l_row, v_p_0)
                 v_p_0 = softmax_helper.cast_p(v_p_0)
@@ -402,6 +582,7 @@ def build_flash_attn_dualwave_swp_module(
                 if const_expr(traits.PAGED):
                     _c6_kpid_lds = page_ids.load_page_id_lds(j_idx + 1)
                 v_s_0 = gemm_helper.qk(v_k, q_all_scaled_bf16)
+                v_s_0 = add_score_bias(v_s_0, j_idx - 1)
                 v_p_1 = softmax_helper.exp2(v_p_1, 16, 16)
                 l_row = softmax_helper.reduce_sum(l_row, v_p_1)
                 v_p_1 = softmax_helper.cast_p(v_p_1)
@@ -493,6 +674,7 @@ def build_flash_attn_dualwave_swp_module(
             if const_expr(traits.PAGED):
                 ec2_pageid_lds = page_ids.load_page_id_lds(max_m1)
             v_s_1 = gemm_helper.qk(v_k, q_all_scaled_bf16)
+            v_s_1 = add_score_bias(v_s_1, max_m3)
             v_p_0 = softmax_helper.exp2(v_p_0, 16, 16)
             l_row = softmax_helper.reduce_sum(l_row, v_p_0)
             v_p_0 = softmax_helper.cast_p(v_p_0)
@@ -560,6 +742,7 @@ def build_flash_attn_dualwave_swp_module(
 
             # Epilogue C5 computes MMA0, folds rescale_e3 into l_row, and finishes v_p_1 softmax.
             v_s_0 = gemm_helper.qk(v_k, q_all_scaled_bf16)
+            v_s_0 = add_score_bias(v_s_0, max_m2)
             l_row = softmax_helper.apply_l_rescale(l_row, rescale_e3)
             v_p_1 = softmax_helper.exp2(v_p_1, 16, 16)
             l_row = softmax_helper.reduce_sum(l_row, v_p_1)
@@ -619,6 +802,7 @@ def build_flash_attn_dualwave_swp_module(
 
             # Epilogue C9 computes the last-tile MMA0, folds rescale_e7 into l_row, and finishes v_p_0.
             v_s_1 = gemm_helper.qk(v_k, q_all_scaled_bf16)
+            v_s_1 = add_score_bias(v_s_1, max_m1)
             l_row = softmax_helper.apply_l_rescale(l_row, rescale_e7)
             v_p_0 = softmax_helper.exp2(v_p_0, 16, 16)
             l_row = softmax_helper.reduce_sum(l_row, v_p_0)
@@ -746,6 +930,8 @@ def build_flash_attn_dualwave_swp_module(
         CuSeqQ: fx.Tensor,
         CuSeqKv: fx.Tensor,
         BlockTable: fx.Tensor,
+        Bias: fx.Tensor,
+        AlibiSlopes: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
@@ -753,6 +939,8 @@ def build_flash_attn_dualwave_swp_module(
         stride_kv_n: fx.Int32,
         head_dim_runtime: fx.Int32,
         block_table_stride: fx.Int32,
+        bias_stride0: fx.Int32,
+        alibi_stride_b: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         # Make shape/mode traits visible to the JIT cache key.
@@ -784,12 +972,16 @@ def build_flash_attn_dualwave_swp_module(
             CuSeqQ,
             CuSeqKv,
             BlockTable,
+            Bias,
+            AlibiSlopes,
             seq_len,
             seq_len_kv,
             stride_q_n,
             stride_kv_n,
             head_dim_runtime,
             block_table_stride,
+            bias_stride0,
+            alibi_stride_b,
             value_attrs={
                 "rocdl.waves_per_eu": traits.WAVES_PER_EU,
                 "rocdl.flat_work_group_size": f"{traits.BLOCK_SIZE},{traits.BLOCK_SIZE}",
@@ -817,6 +1009,44 @@ def build_flash_attn_dualwave_swp_module(
         },
     }
 
+    def _prep_alibi(alibi_slopes, placeholder):
+        """Validate the ALiBi slope table and flatten it for linear indexing.
+
+        aiter's contract: fp32, (num_heads,) or (batch, num_heads). The kernel
+        addresses it with a single linear element offset
+        (batch_idx * alibi_stride_b + q_head_idx), so a 1D table broadcasts over
+        batch by passing stride 0. Returns (tensor, alibi_stride_b).
+        """
+        if alibi_slopes is None:
+            if HAS_ALIBI:
+                raise ValueError(
+                    "flash_attn_dualwave_swp was built with has_alibi=True but no `alibi_slopes` "
+                    "tensor was provided; pass an fp32 (num_heads,) or (batch, num_heads) slope table."
+                )
+            # Only read under const_expr(HAS_ALIBI); placeholder matches the
+            # cu_seqlens/block_table/bias convention.
+            return placeholder, 0
+        if not HAS_ALIBI:
+            # Silently ignoring these would give wrong numerics with no diagnostic.
+            raise ValueError(
+                "`alibi_slopes` was provided but flash_attn_dualwave_swp was built with "
+                "has_alibi=False; rebuild with has_alibi=True."
+            )
+        if alibi_slopes.dim() not in (1, 2):
+            raise ValueError(
+                f"alibi_slopes must be 1D (num_heads,) or 2D (batch, num_heads), got shape {tuple(alibi_slopes.shape)}"
+            )
+        if alibi_slopes.shape[-1] != num_heads:
+            raise ValueError(
+                f"alibi_slopes last dim must be num_heads={num_heads}, got shape {tuple(alibi_slopes.shape)}"
+            )
+        # The kernel reads raw f32 words, so a bf16/fp16 table would be read as garbage.
+        if not alibi_slopes.is_floating_point() or alibi_slopes.element_size() != 4:
+            raise ValueError(f"alibi_slopes must be fp32, got dtype {alibi_slopes.dtype}")
+        alibi_slopes = alibi_slopes.contiguous()
+        alibi_stride_b = alibi_slopes.stride(0) if alibi_slopes.dim() == 2 else 0
+        return alibi_slopes.reshape(-1), alibi_stride_b
+
     def _launch(
         Q,
         K,
@@ -835,6 +1065,9 @@ def build_flash_attn_dualwave_swp_module(
         cu_seqlens_kv=None,
         block_table=None,
         block_table_stride=None,
+        bias=None,
+        bias_stride0=None,
+        alibi_slopes=None,
         lse=None,
         stream=None,
     ):
@@ -872,6 +1105,26 @@ def build_flash_attn_dualwave_swp_module(
             block_table = O
         if block_table_stride is None:
             block_table_stride = 0
+        # Bias is only read under const_expr(HAS_BIAS); use O as a placeholder
+        # otherwise, matching the cu_seqlens/block_table convention above.
+        if bias is None:
+            if HAS_BIAS:
+                raise ValueError(
+                    "flash_attn_dualwave_swp was built with has_bias=True but no `bias` tensor was "
+                    "provided; pass a [total_q, max_seqlen_kv] bias (varlen) or a "
+                    "[seq_len, seq_len_kv] bias (dense), with the same dtype as q."
+                )
+            bias = O
+            bias_stride0 = 0
+        else:
+            # The kernel addresses Bias with a single linear element offset
+            # (q_row * bias_stride0 + k_col), so hand it a flat tensor: a 2D one
+            # would make fx.slice index rows instead of elements.
+            bias = bias.contiguous()
+            if bias_stride0 is None:
+                bias_stride0 = bias.stride(0)
+            bias = bias.view(-1)
+        alibi_slopes, alibi_stride_b = _prep_alibi(alibi_slopes, O)
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
             if stream is None:
                 return launch_flash_attn_dualwave_swp(
@@ -884,6 +1137,8 @@ def build_flash_attn_dualwave_swp_module(
                     cu_seqlens_q,
                     cu_seqlens_kv,
                     block_table,
+                    bias,
+                    alibi_slopes,
                     batch_size,
                     seq_len,
                     seq_len_kv,
@@ -891,6 +1146,8 @@ def build_flash_attn_dualwave_swp_module(
                     stride_kv_n,
                     head_dim_runtime,
                     block_table_stride,
+                    bias_stride0,
+                    alibi_stride_b,
                 )
             return launch_flash_attn_dualwave_swp(
                 Q,
@@ -902,6 +1159,8 @@ def build_flash_attn_dualwave_swp_module(
                 cu_seqlens_q,
                 cu_seqlens_kv,
                 block_table,
+                bias,
+                alibi_slopes,
                 batch_size,
                 seq_len,
                 seq_len_kv,
@@ -909,6 +1168,8 @@ def build_flash_attn_dualwave_swp_module(
                 stride_kv_n,
                 head_dim_runtime,
                 block_table_stride,
+                bias_stride0,
+                alibi_stride_b,
                 stream=stream,
             )
 
@@ -930,6 +1191,9 @@ def build_flash_attn_dualwave_swp_module(
         cu_seqlens_kv=None,
         block_table=None,
         block_table_stride=None,
+        bias=None,
+        bias_stride0=None,
+        alibi_slopes=None,
         lse=None,
         stream=None,
     ):
@@ -961,6 +1225,26 @@ def build_flash_attn_dualwave_swp_module(
             block_table = O
         if block_table_stride is None:
             block_table_stride = 0
+        # Bias is only read under const_expr(HAS_BIAS); use O as a placeholder
+        # otherwise, matching the cu_seqlens/block_table convention above.
+        if bias is None:
+            if HAS_BIAS:
+                raise ValueError(
+                    "flash_attn_dualwave_swp was built with has_bias=True but no `bias` tensor was "
+                    "provided; pass a [total_q, max_seqlen_kv] bias (varlen) or a "
+                    "[seq_len, seq_len_kv] bias (dense), with the same dtype as q."
+                )
+            bias = O
+            bias_stride0 = 0
+        else:
+            # The kernel addresses Bias with a single linear element offset
+            # (q_row * bias_stride0 + k_col), so hand it a flat tensor: a 2D one
+            # would make fx.slice index rows instead of elements.
+            bias = bias.contiguous()
+            if bias_stride0 is None:
+                bias_stride0 = bias.stride(0)
+            bias = bias.view(-1)
+        alibi_slopes, alibi_stride_b = _prep_alibi(alibi_slopes, O)
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
             return flyc.compile(
                 launch_flash_attn_dualwave_swp,
@@ -973,6 +1257,8 @@ def build_flash_attn_dualwave_swp_module(
                 cu_seqlens_q,
                 cu_seqlens_kv,
                 block_table,
+                bias,
+                alibi_slopes,
                 batch_size,
                 seq_len,
                 seq_len_kv,
@@ -980,6 +1266,8 @@ def build_flash_attn_dualwave_swp_module(
                 stride_kv_n,
                 head_dim_runtime,
                 block_table_stride,
+                bias_stride0,
+                alibi_stride_b,
                 fx.Stream(stream),
             )
 
