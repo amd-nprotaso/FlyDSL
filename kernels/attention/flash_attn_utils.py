@@ -3728,7 +3728,17 @@ class DualwaveSoftmaxHelper(DualwaveKernelContext):
         return v_o, m_new, l_row, v_p
 
     def _lazy_rescale_o_rescale(self, _n, *_st, v_o, m_row, l_row, m_tile_max, v_p):
-        corr = rocdl.exp2(T.f32, as_mlir_value(_fsub(m_row, m_tile_max, self.fm_fast)))
+        # Take the running max exactly like rescale_o. The guard that selects this
+        # branch is a wave-wide ballot (all_below), so this code also runs for lanes
+        # whose own m_tile_max is BELOW m_row -- those lanes must be a no-op, not a
+        # rescale. Using m_tile_max directly would make corr = exp2(m_row - m_tile_max)
+        # blow up (a fully-masked tile gives m_tile_max = -inf, so corr = exp2(+inf)
+        # = inf, and the later inf*0 turns O into NaN) and would drop m_row below the
+        # true running max. Rows within one wave only disagree this strongly when the
+        # per-row diagonals are far apart and the score bias is large -- causal +
+        # cross-seqlen (seq_len_q != seq_len_kv) with ALiBi or a large attention bias.
+        m_new = _fmax(m_row, m_tile_max, self.fm_fast)
+        corr = rocdl.exp2(T.f32, as_mlir_value(_fsub(m_row, m_new, self.fm_fast)))
         scaled_accs = list(v_o)
         self.scale_o(scaled_accs, corr)
         out = [as_mlir_value(scaled_accs[dc]) for dc in range(self.traits.D_CHUNKS)]
@@ -3741,7 +3751,7 @@ class DualwaveSoftmaxHelper(DualwaveKernelContext):
         )
         out.append(_v_p_to_vec32(scaled_p))
         out.append(as_mlir_value(_fmul(l_row, corr, self.fm_fast)))
-        out.append(_anchor_scalar_f32(m_tile_max))
+        out.append(_anchor_scalar_f32(m_new))
         return out
 
     def lazy_rescale_o(self, v_o, m_row, l_row, m_tile_max, v_p):

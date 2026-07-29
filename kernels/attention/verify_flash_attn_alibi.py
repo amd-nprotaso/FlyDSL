@@ -19,16 +19,27 @@ ALiBi follows aiter's contract (ck-tile block_position_encoding.hpp):
   the kernel's alibi_stride_b handling is covered.
 
 Unlike the dense-bias path -- which aiter rejects for paged KV -- aiter supports
-alibi_slopes on both flash_attn_func and flash_attn_varlen_func, so dense,
-varlen and split-K rows get a real second opinion on top of the torch reference.
-Paged rows gate on the fp32 reference alone, with a deliberately shuffled block
-table so a page-order bug cannot alias into a pass.
+alibi_slopes on flash_attn_func and flash_attn_varlen_func, so the NON-CAUSAL
+dense, varlen and split-K rows get a real second opinion on top of the torch
+reference. Paged rows gate on the fp32 reference alone, with a deliberately
+shuffled block table so a page-order bug cannot alias into a pass.
 
-One known and intended divergence: under *pure causal*, aiter switches to an
-AlibiMode::VERTICAL shortcut that adds +slope*k_col instead. That differs from
-the general form only by a per-row constant, so outputs are identical (which is
-what we compare) but LSE is offset. aiter's own LSE assertion for this case is
-commented out (op_tests/test_mha.py:350-351).
+AITER_CAUSAL_ALIBI_BROKEN: aiter's causal + alibi_slopes path is unusable in
+this build, so causal rows skip the aiter cross-check. Measured here on gfx950:
+
+  - varlen causal + alibi_slopes *hard-faults the process* ("Memory access fault
+    ... on address 0x1000"). Reproduced standalone with no FlyDSL kernel in the
+    picture, so it would abort this whole gate rather than fail one row.
+  - dense causal + alibi_slopes returns a wrong answer: cos 0.964 against the
+    fp32 reference, degrading on every head. Sweeping a scale factor on the
+    slope (log2e, 1/log2e, sqrt(D), ...) does not explain it -- the unscaled
+    form is the closest match -- so it is not a convention mismatch.
+
+Both torch formulations of ALiBi (the general -slope*|dist| and aiter's
+AlibiMode::VERTICAL +slope*k_col causal shortcut) agree to cos 1.000000, as they
+must: they differ by a per-row constant that softmax cancels. The kernel matches
+both to 0.999998, so the causal path is covered by the reference even without
+aiter. Only LSE differs between the two forms; we emit the general one.
 
 Usage:  PYTHONPATH=/var/home/bias/FlyDSL python3 verify_flash_attn_alibi.py
 """
@@ -50,8 +61,18 @@ except Exception as e:  # aiter not installed / import failure
 
 torch.manual_seed(0)
 
+# aiter's causal + alibi_slopes path is broken (see module docstring): varlen
+# faults the process outright and dense returns a wrong answer, so it is not a
+# usable baseline. Causal rows report nan for aiter and gate on the fp32
+# reference alone. Flip to False to re-measure if aiter is ever fixed.
+AITER_CAUSAL_ALIBI_BROKEN = True
+
 D = 128
 dtype = torch.bfloat16
+
+
+def _aiter_usable(causal):
+    return not (causal and AITER_CAUSAL_ALIBI_BROKEN)
 
 
 def make_slopes(B, H, two_d):
@@ -142,7 +163,7 @@ def run(B, S, H, H_KV, causal, two_d, with_bias=False):
     # aiter treats bias and alibi_slopes as mutually exclusive, so the combined
     # row gates on the torch reference alone.
     c_ait = float("nan")
-    if aiter_flash_attn_func is not None and not with_bias:
+    if aiter_flash_attn_func is not None and not with_bias and _aiter_usable(causal):
         try:
             oa = aiter_flash_attn_func(q, k, v, causal=causal, alibi_slopes=slopes)
             torch.cuda.synchronize()
@@ -234,7 +255,7 @@ def run_varlen(seqlens_q, seqlens_kv, H, H_KV, causal, two_d):
     ref = ref_fp32_varlen(q, k, v, slopes, cu_q, cu_kv, causal)
 
     c_ait = float("nan")
-    if aiter_flash_attn_varlen_func is not None:
+    if aiter_flash_attn_varlen_func is not None and _aiter_usable(causal):
         try:
             oa = aiter_flash_attn_varlen_func(
                 q, k, v, cu_q_t, cu_kv_t, max_sq, max_skv, causal=causal, alibi_slopes=slopes
@@ -443,7 +464,7 @@ def run_splitk(B, S, H, H_KV, causal, splits, two_d):
 
     ref = ref_fp32(q, k, v, slopes, causal)
     c_ait = float("nan")
-    if aiter_flash_attn_func is not None:
+    if aiter_flash_attn_func is not None and _aiter_usable(causal):
         try:
             oa = aiter_flash_attn_func(q, k, v, causal=causal, alibi_slopes=slopes)
             torch.cuda.synchronize()
