@@ -1,20 +1,37 @@
-"""Benchmark the gfx950 dualwave flash-attention kernel WITH AN ATTENTION SINK
-across every Q mode and KV source: dense, packed-varlen, paged KV, and split-K.
+"""Benchmark the gfx950 dualwave flash-attention kernel WITH ALiBi across every
+Q mode and KV source: dense, packed-varlen, paged KV, and split-K.
 
-WHAT THIS MEASURES, AND WHY IT IS NOT SHAPED LIKE bench_flash_attn_aiter_bias.py.
-There is no aiter sink baseline to compare against on this hardware: aiter
-exposes the sink only through fmha_fwd_with_sink_asm / fmha_fwd_with_sink_varlen_asm,
-which are gfx1250 ASM kernels and do not run on gfx950. So the primary axis here
-is not fly-vs-aiter, it is the *cost of the sink itself*:
+This measures two different things at once, because for ALiBi both are available
+and neither alone is the whole story:
 
-  sink ms    flash_attn_gfx950 built with has_sink=True.
-  base ms    the same build with has_sink=False, same inputs, same shapes.
-             This is a true like-for-like pair -- identical work, one extra
-             epilogue term -- so `ovh` below is the honest cost of the feature.
-  aiter ms   aiter flash-attn WITHOUT a sink. An external reference point only.
-             It is NOT computing the same thing as the sink column; do not read
-             `aiter TF` as a sink comparison. It is here so the fly numbers can
-             be placed against a known kernel on the same shapes.
+  alibi ms   flash_attn_gfx950 built with has_alibi=True.
+  base ms    the same build with has_alibi=False, same inputs, same shapes.
+             A true like-for-like pair -- identical work, one extra term folded
+             into every score element -- so `ovh` is the honest cost of ALiBi.
+  aiter ms   aiter flash-attn with THE SAME slopes. Unlike the sink benchmark
+             (where no aiter sink kernel exists on gfx950), this is a real
+             like-for-like comparison, so `fly/ait` is meaningful -- but only on
+             the rows where aiter's ALiBi path is usable at all; see below.
+
+ALiBi follows aiter's contract (ck-tile block_position_encoding.hpp):
+alibi_slopes is fp32, positive, and score(i,j) += -slope * |i + Skv - Sq - j|,
+added after the 1/sqrt(D) scale, bottom-right aligned like the causal mask.
+Slopes here are the 1D (num_heads,) form, broadcast over batch. The 2D
+(batch, num_heads) form is not timed separately: it differs only by a nonzero
+alibi_stride_b on a single wave-uniform dword load per (batch, q head), which is
+below the noise floor of every row in this table.
+
+AITER'S CAUSAL ALiBi PATH IS NOT TRUSTWORTHY ON THIS BUILD. Measured on gfx950:
+  - varlen + causal + alibi_slopes HARD-FAULTS the process (GPU core dump).
+    Reproduced standalone with no FlyDSL kernel in the picture. It would abort
+    this whole run mid-table, so those rows never call aiter at all -- gated by
+    AITER_VARLEN_CAUSAL_ALIBI_FATAL below.
+  - dense + causal + alibi_slopes runs and returns finite values, but the WRONG
+    answer: cos 0.964 against an fp32 reference, degrading per head (see
+    verify_flash_attn_alibi.py, which skips it for the same reason). It is timed
+    here -- it is the real mha_fwd_bf16_alibi_mask_* kernel doing the real masked
+    loop -- but read `fly/ait` on causal dense/splitk rows as indicative only.
+    A kernel that is wrong could in principle be wrong because it skipped work.
 
 Columns:
   GFLOP     the work this row actually does, counting only unmasked
@@ -23,33 +40,33 @@ Columns:
             row does strictly LESS work than the dense row on the same (B, seq)
             line and their ms are not comparable. TFLOPS is per-row work over
             per-row time, so TFLOPS is comparable; ms is not.
-  ovh       sink_ms / base_ms. The sink is a single epilogue term -- one fmax,
-            two exp2, one fma per row, hoisted out of the kv loop, plus one
-            wave-uniform dword load per q head -- so this should sit at ~1.00
-            and drift toward 1.00 as S grows and the O(S^2) inner loop dominates
-            the O(1) epilogue. A row meaningfully above 1.00 at large S is a
-            finding, not noise.
-  vs dns    this row's sink TF over the *dense* sink TF at the same (B, seq,
+  ovh       alibi_ms / base_ms. Unlike the sink -- which is one epilogue term
+            hoisted out of the kv loop, so its overhead vanishes as S grows --
+            ALiBi costs one sub plus one fma on EVERY score element, inside the
+            kv loop, with no memory traffic (absf lowers to a VOP3 source
+            modifier). That is O(S^2) work against an O(S^2) kernel, so ovh
+            should be roughly FLAT in S, not decaying toward 1.00. A row where
+            ovh climbs with S is a finding; a row near 1.00 means the fold hid
+            behind the MFMA chain.
+  vs dns    this row's alibi TF over the *dense* alibi TF at the same (B, seq,
             causal). Work-normalized, so it is meaningful for every mode
-            including varlen. 1.00 by definition on dense rows; below 1.00 means
-            the mode costs throughput relative to plain dense attention.
-  fly/ait   sink TF over aiter TF, i.e. how the fly sink kernel throughput
-            compares to aiter on the same shapes. Above 1.00 means fly is
-            faster. Note this is fly-WITH-sink over aiter-WITHOUT-sink, so it
-            charges fly for the sink epilogue; divide by `ovh` (or read
-            base TF / aiter TF) for the no-sink-on-both comparison. nan on
-            paged rows, where there is no comparable aiter call.
+            including varlen, and it is the only baseline paged rows get.
+            1.00 by definition on dense rows.
+  fly/ait   alibi TF / aiter TF, both with the same slopes. Above 1.00 means fly
+            is faster. nan on paged rows (aiter's paged entry point is a
+            packed-Q batch-prefill, a different shape of work) and on varlen
+            causal rows (fatal, see above).
 
-Unlike the bias benchmark there are no addressing SKIPs: the sink is an
-(num_heads,) fp32 table, so it can never exceed the 4 GiB buffer-descriptor
+Unlike the bias benchmark there are no addressing SKIPs: the slopes are a
+(num_heads,) fp32 table, so they can never exceed the 4 GiB buffer-descriptor
 clamp or the i32 offset range the way a dense (Sq, Skv) bias can. Only the
 split-K workspace is capped.
 
 FLOPs = 4 * unmasked_pairs * D * H (2 for QK^T + 2 for P@V), matching the repo's
 _flops helper in tests/kernels/test_flash_attn_fwd.py, so causal rows are not
-inflated and varlen sums per sequence. The sink adds one extra logit to the
-softmax denominator, not a matmul, so it is not counted -- which is precisely
-why `ovh` rather than TFLOPS is the number to read for its cost.
+inflated and varlen sums per sequence. ALiBi adds an fma per score, not a
+matmul, so it is not counted -- which is why `ovh` rather than TFLOPS is the
+number to read for its cost.
 
 Because the timed path hand-builds the kernel's positional ABI (see make_args),
 a selftest always runs first and asserts, per mode AND per build, that the
@@ -59,8 +76,8 @@ an error -- and here it would also silently corrupt `ovh`, since that ratio is
 only meaningful if both halves ran the work they claim to.
 
 Usage:
-    PYTHONPATH=/var/home/FlyDSL python3 bench_flash_attn_sink.py
-    PYTHONPATH=/var/home/FlyDSL python3 bench_flash_attn_sink.py 1 2   # batch sizes
+    PYTHONPATH=/var/home/FlyDSL python3 bench_flash_attn_alibi.py
+    PYTHONPATH=/var/home/FlyDSL python3 bench_flash_attn_alibi.py 1 2   # batch sizes
 """
 
 import sys
@@ -81,7 +98,13 @@ except Exception as e:  # aiter not installed / import failure
 
 torch.manual_seed(0)
 
-OUT_PATH = "bench_flash_attn_sink.txt"
+# aiter's varlen + causal + alibi_slopes path faults the GPU (see module
+# docstring), which aborts the process rather than raising, so it cannot be
+# guarded with try/except -- those rows must never call it. Flip to False to
+# re-measure if aiter is ever fixed.
+AITER_VARLEN_CAUSAL_ALIBI_FATAL = True
+
+OUT_PATH = "bench_flash_attn_alibi.txt"
 _out_fh = open(OUT_PATH, "w", buffering=1)  # line-buffered so rows survive a crash
 
 
@@ -143,8 +166,8 @@ def splitk_fits(B, S):
 
 
 def row_fits(B, S, mode):
-    """Per-row feasibility. The sink is (H,) fp32 and never constrains a row, so
-    unlike the bias benchmark only the split-K workspace can rule one out."""
+    """Per-row feasibility. The slopes are (H,) fp32 and never constrain a row,
+    so unlike the bias benchmark only the split-K workspace can rule one out."""
     if mode == "splitk":
         return splitk_fits(B, S)
     return True, ""
@@ -158,6 +181,21 @@ def flops(seqlens_q, causal):
     return 4.0 * valid * D * H
 
 
+def make_slopes():
+    """The canonical geometric ALiBi ladder, 1D (num_heads,) fp32, positive.
+
+    aiter takes positive slopes and negates internally; the kernel folds the
+    negation and log2(e) into the loaded value. The magnitudes do not affect
+    timing (they are data, not control flow) -- the ladder is used simply
+    because it is what a real model passes.
+    """
+    return torch.tensor(
+        [2.0 ** (-((h + 1) * 8.0 / H)) for h in range(H)],
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+
 def build_inputs(B, S, mode):
     """Allocate the tensors for one row and describe how to launch it.
 
@@ -168,10 +206,7 @@ def build_inputs(B, S, mode):
     varlen = mode == "varlen"
     paged = mode == "paged"
 
-    # Per-q-head fp32 sink. The value does not affect timing (it is data, not
-    # control flow); a moderate draw just keeps the epilogue off any denormal
-    # slow path.
-    sink = torch.randn(H, dtype=torch.float32, device=dev)
+    slopes = make_slopes()
 
     if varlen:
         seqlens = varlen_seqlens(B, S)
@@ -189,7 +224,7 @@ def build_inputs(B, S, mode):
             q=q,
             k=k,
             v=v,
-            sink=sink,
+            slopes=slopes,
             out=out,
             cu=cu_t,
             block_table=None,
@@ -218,7 +253,7 @@ def build_inputs(B, S, mode):
             q=q,
             k=k,
             v=v,
-            sink=sink,
+            slopes=slopes,
             out=out,
             cu=None,
             block_table=bt_flat,
@@ -241,7 +276,7 @@ def build_inputs(B, S, mode):
             q=q,
             k=k,
             v=v,
-            sink=sink,
+            slopes=slopes,
             out=out,
             cu=None,
             block_table=None,
@@ -256,7 +291,7 @@ def build_inputs(B, S, mode):
         q=q,
         k=k,
         v=v,
-        sink=sink,
+        slopes=slopes,
         out=out,
         cu=None,
         block_table=None,
@@ -267,27 +302,31 @@ def build_inputs(B, S, mode):
     )
 
 
-def make_exe(causal, inp, with_sink):
+def make_exe(causal, inp, with_alibi):
     return build_flash_attn_dualwave_swp_module(
         num_heads=H,
         head_dim=D,
         causal=causal,
         dtype_str="bf16",
         num_kv_heads=H_KV,
-        has_sink=with_sink,
+        has_alibi=with_alibi,
         **inp["build"],
     )
 
 
-def make_args(B, S, inp, stream, with_sink):
+def make_args(B, S, inp, stream, with_alibi):
     """The positional ABI that _compile builds internally.
 
     `out` is the placeholder for tensors this build never reads, matching the
     kernel's own convention; the cu_seqlens / BlockTable / workspace slots carry
-    real tensors only in the modes that read them, and the Sink slot carries the
-    real table only when has_sink=True (a has_sink=False build never reads it,
-    exactly as _prep_sink(None, O) would arrange). Kept in one place so the
-    selftest below covers every mode's and both builds' slot assignment.
+    real tensors only in the modes that read them, and the AlibiSlopes slot
+    carries the real table only when has_alibi=True (a has_alibi=False build
+    never reads it, exactly as _prep_alibi(None, O) would arrange). Kept in one
+    place so the selftest below covers every mode's and both builds' slot
+    assignment.
+
+    alibi_stride_b is 0 for both builds: these slopes are 1D (num_heads,), which
+    _prep_alibi broadcasts over batch by passing stride 0.
     """
     out = inp["out"]
     return (
@@ -301,8 +340,8 @@ def make_args(B, S, inp, stream, with_sink):
         inp["cu"] if inp["cu"] is not None else out,  # CuSeqKv
         inp["block_table"] if inp["block_table"] is not None else out,
         out,  # Bias: these builds are has_bias=False, so it is never read
-        out,  # AlibiSlopes: these builds are has_alibi=False, so it is never read
-        inp["sink"] if with_sink else out,
+        inp["slopes"] if with_alibi else out,
+        out,  # Sink: these builds are has_sink=False, so it is never read
         B,
         S,  # seq_len (varlen: max_seqlen_q, which sizes grid_y)
         S,  # seq_len_kv
@@ -311,12 +350,12 @@ def make_args(B, S, inp, stream, with_sink):
         D,  # head_dim_runtime
         inp["block_table_stride"],
         0,  # bias_stride0
-        0,  # alibi_stride_b
+        0,  # alibi_stride_b (1D slopes broadcast over batch)
         fx.Stream(stream),
     )
 
 
-def compiled_call(B, S, inp, stream, with_sink, causal):
+def compiled_call(B, S, inp, stream, with_alibi, causal):
     """Precompile one build and return a zero-overhead positional caller.
 
     Times the precompiled executable, not the _launch wrapper: the wrapper
@@ -325,12 +364,12 @@ def compiled_call(B, S, inp, stream, with_sink, causal):
     report host dispatch cost instead of kernel performance. It would also land
     identically on both halves of `ovh` and wash the ratio out toward 1.00.
     """
-    exe = make_exe(causal, inp, with_sink)
+    exe = make_exe(causal, inp, with_alibi)
     launch = dict(inp["launch"], stream=stream)
-    if with_sink:
-        launch["sink"] = inp["sink"]
+    if with_alibi:
+        launch["alibi_slopes"] = inp["slopes"]
     compiled = exe.compile(inp["q"], inp["k"], inp["v"], inp["out"], B, S, **launch)
-    args = make_args(B, S, inp, stream, with_sink)
+    args = make_args(B, S, inp, stream, with_alibi)
 
     def call():
         compiled(*args)
@@ -345,11 +384,10 @@ def time_interleaved(calls, warmup, iters):
     Do NOT time one kernel to completion and then the next. The GPU clocks
     settle downward as a run heats up, so whichever call is measured first comes
     out systematically faster and the ratio between them is biased. Measured on
-    this machine, dense S=8192 non-causal, the *same* sink kernel timed 0.9898 ms
-    when measured first and 1.0488 ms when measured second -- a 6% swing that
-    showed up as ovh 0.947 (sink "faster" than base) purely from ordering.
-    Alternating the samples exposes every call to the same drift and brings that
-    row to ovh 0.998.
+    this machine (in the sink benchmark, same harness), the *same* kernel timed
+    0.9898 ms when measured first and 1.0488 ms when measured second -- a 6%
+    swing that showed up as an ovh below 1.00 purely from ordering. Alternating
+    the samples exposes every call to the same drift.
     """
     for c in calls:
         for _ in range(warmup):
@@ -373,8 +411,8 @@ def selftest(S=512, B=2, causal=True):
 
     The timed path calls the precompiled executable positionally; a wrong slot
     would silently benchmark the wrong work instead of raising. Both the
-    has_sink=True and has_sink=False builds are checked, because `ovh` compares
-    them directly and is only meaningful if each ran what it claims to.
+    has_alibi=True and has_alibi=False builds are checked, because `ovh`
+    compares them directly and is only meaningful if each ran what it claims to.
     """
     ok = True
     for mode in MODES:
@@ -382,24 +420,24 @@ def selftest(S=512, B=2, causal=True):
         if not fits:
             print(f"[selftest] {mode:>7}: SKIP ({why})", file=sys.stderr, flush=True)
             continue
-        for with_sink in (True, False):
+        for with_alibi in (True, False):
             inp = build_inputs(B, S, mode)
-            exe = make_exe(causal, inp, with_sink)
+            exe = make_exe(causal, inp, with_alibi)
             stream = torch.cuda.current_stream()
             launch = dict(inp["launch"], stream=stream)
-            if with_sink:
-                launch["sink"] = inp["sink"]
+            if with_alibi:
+                launch["alibi_slopes"] = inp["slopes"]
             exe(inp["q"], inp["k"], inp["v"], inp["out"], B, S, **launch)
             torch.cuda.synchronize()
             ref = inp["out"].clone()
             inp["out"].zero_()
             torch.cuda.synchronize()
             compiled = exe.compile(inp["q"], inp["k"], inp["v"], inp["out"], B, S, **launch)
-            compiled(*make_args(B, S, inp, stream, with_sink))
+            compiled(*make_args(B, S, inp, stream, with_alibi))
             torch.cuda.synchronize()
             same = torch.equal(ref, inp["out"])
             ok &= same
-            tag = "sink" if with_sink else "base"
+            tag = "alibi" if with_alibi else " base"
             print(
                 f"[selftest] {mode:>7} {tag}: {'ABI ok (bitwise identical)' if same else 'ABI MISMATCH'}",
                 file=sys.stderr,
@@ -408,63 +446,68 @@ def selftest(S=512, B=2, causal=True):
             del inp, ref
             torch.cuda.empty_cache()
 
-    # The sink must actually change the output, or `ovh` would be measuring two
+    # ALiBi must actually change the output, or `ovh` would be measuring two
     # identical kernels and would report a meaningless 1.00.
     inp = build_inputs(B, S, "dense")
     stream = torch.cuda.current_stream()
-    make_exe(causal, inp, True)(inp["q"], inp["k"], inp["v"], inp["out"], B, S, sink=inp["sink"], stream=stream)
+    make_exe(causal, inp, True)(
+        inp["q"], inp["k"], inp["v"], inp["out"], B, S, alibi_slopes=inp["slopes"], stream=stream
+    )
     torch.cuda.synchronize()
-    o_sink = inp["out"].clone()
+    o_alibi = inp["out"].clone()
     inp["out"].zero_()
     make_exe(causal, inp, False)(inp["q"], inp["k"], inp["v"], inp["out"], B, S, stream=stream)
     torch.cuda.synchronize()
-    differs = not torch.equal(o_sink, inp["out"])
+    differs = not torch.equal(o_alibi, inp["out"])
     ok &= differs
-    verdict = "outputs differ (sink is live)" if differs else "IDENTICAL -- sink is a no-op"
-    print(f"[selftest]   dense sink-vs-base: {verdict}", file=sys.stderr, flush=True)
-    del inp, o_sink
+    verdict = "outputs differ (ALiBi is live)" if differs else "IDENTICAL -- ALiBi is a no-op"
+    print(f"[selftest]   dense alibi-vs-base: {verdict}", file=sys.stderr, flush=True)
+    del inp, o_alibi
     torch.cuda.empty_cache()
     return ok
 
 
 def aiter_callable(S, causal, mode, inp):
-    """aiter equivalent for this row, WITHOUT a sink, or None when aiter cannot
-    run the mode.
+    """aiter equivalent for this row, WITH the same slopes, or None when aiter
+    cannot run the mode.
 
-    aiter's sink kernels (fmha_fwd_with_sink_asm / _varlen_asm) are gfx1250 ASM
-    and do not run on gfx950, so there is no like-for-like aiter sink call to
-    make. These are plain flash-attn timings, present only as a reference point.
+    See the module docstring: varlen+causal is fatal and is never called; paged
+    has no comparable entry point; dense/splitk causal are timed but are
+    numerically wrong on this aiter build.
     """
     if aiter_flash_attn_func is None:
         return None
-    q, k, v = inp["q"], inp["k"], inp["v"]
+    q, k, v, slopes = inp["q"], inp["k"], inp["v"], inp["slopes"]
     if mode == "varlen":
+        if causal and AITER_VARLEN_CAUSAL_ALIBI_FATAL:
+            # Faults the GPU and aborts the process; try/except cannot catch it.
+            return None
         cu = inp["cu"]
-        return lambda: aiter_flash_attn_varlen_func(q, k, v, cu, cu, S, S, causal=causal)
+        return lambda: aiter_flash_attn_varlen_func(q, k, v, cu, cu, S, S, causal=causal, alibi_slopes=slopes)
     if mode == "paged":
         # Our paged row keeps Q dense and maps KV tiles through a block table;
         # aiter's paged entry point is a packed-Q batch-prefill, so timing it
         # here would compare two different shapes of work.
         return None
-    return lambda: aiter_flash_attn_func(q, k, v, causal=causal)
+    return lambda: aiter_flash_attn_func(q, k, v, causal=causal, alibi_slopes=slopes)
 
 
 def run_one(B, S, causal, mode):
     """Time one (batch, seq_len, causal, mode) point.
 
-    Returns (sink_ms, base_ms, aiter_ms, seqlens)."""
+    Returns (alibi_ms, base_ms, aiter_ms, seqlens)."""
     dbg(f"run_one begin B={B} S={S} causal={causal} mode={mode}")
     inp = build_inputs(B, S, mode)
     stream = torch.cuda.current_stream()
 
-    dbg(f"build FlyDSL sink kernel (mode={mode})")
-    sink_call = compiled_call(B, S, inp, stream, True, causal)
-    dbg(f"build FlyDSL no-sink kernel (mode={mode})")
+    dbg(f"build FlyDSL alibi kernel (mode={mode})")
+    alibi_call = compiled_call(B, S, inp, stream, True, causal)
+    dbg(f"build FlyDSL no-alibi kernel (mode={mode})")
     base_call = compiled_call(B, S, inp, stream, False, causal)
     aiter_call = aiter_callable(S, causal, mode, inp)
     if aiter_call is not None:
         # Probe once outside the timing loop: a mid-loop throw would discard the
-        # sink/base samples collected alongside it.
+        # alibi/base samples collected alongside it.
         try:
             aiter_call()
             torch.cuda.synchronize()
@@ -477,15 +520,15 @@ def run_one(B, S, causal, mode):
             aiter_call = None
 
     warmup, iters = iters_for(S)
-    calls = [sink_call, base_call] + ([aiter_call] if aiter_call is not None else [])
+    calls = [alibi_call, base_call] + ([aiter_call] if aiter_call is not None else [])
     dbg(f"time {len(calls)} calls interleaved")
     times = time_interleaved(calls, warmup, iters)
-    ms_sink, ms_base = times[0], times[1]
+    ms_alibi, ms_base = times[0], times[1]
     ms_aiter = times[2] if aiter_call is not None else float("nan")
     dbg(f"run_one done B={B} S={S} causal={causal} mode={mode}")
 
     # No explicit del: the closures hold inp/compiled/args and die with run_one.
-    result = (ms_sink, ms_base, ms_aiter, inp["seqlens"])
+    result = (ms_alibi, ms_base, ms_aiter, inp["seqlens"])
     torch.cuda.empty_cache()
     return result
 
@@ -498,35 +541,39 @@ if __name__ == "__main__":
     hdr = (
         f"{'B':>3} {'seq':>7} {'mode':>7} {'causal':>7} | "
         f"{'GFLOP':>9} | "
-        f"{'sink ms':>10} {'base ms':>10} {'aiter ms':>10} | "
+        f"{'alibi ms':>10} {'base ms':>10} {'aiter ms':>10} | "
         f"{'ovh':>7} {'vs dns':>7} {'fly/ait':>8} | "
-        f"{'sink TF':>9} {'base TF':>9} {'aiter TF':>9}"
+        f"{'alibi TF':>9} {'base TF':>9} {'aiter TF':>9}"
     )
-    # sink TF of the dense row, keyed by (B, seq, causal); MODES puts dense first
-    # so it is always populated before the modes that reference it.
+    # alibi TF of the dense row, keyed by (B, seq, causal); MODES puts dense
+    # first so it is always populated before the modes that reference it.
     dense_tf = {}
     emit(f"D={D} H={H} H_KV={H_KV}  dtype={dtype}")
-    emit("flash_attn_gfx950(has_sink=True) vs the same kernel with has_sink=False, on identical inputs")
+    emit("flash_attn_gfx950(has_alibi=True) vs the same kernel with has_alibi=False, and vs aiter")
+    emit("flash-attn with the same slopes, all on identical inputs")
     emit(f"modes: dense | varlen (packed, seqlen fractions {VARLEN_FRACTIONS} of seq)")
     emit(f"       paged (page_size={PAGE_SIZE}, shuffled block table) | splitk (num_kv_splits={SPLITK_SPLITS})")
-    emit("sink: (num_heads,) fp32, one extra softmax logit per q head with no matching V row")
+    emit("alibi: (num_heads,) fp32 geometric ladder, positive, broadcast over batch;")
+    emit("       score(i,j) += -slope * |i + Skv - Sq - j|, applied after the 1/sqrt(D) scale")
     emit("")
-    emit("THE AITER COLUMN HAS NO SINK. aiter's sink kernels (fmha_fwd_with_sink_asm and its varlen")
-    emit("twin) are gfx1250 ASM and do not run on gfx950, so no like-for-like aiter sink call exists.")
-    emit("aiter ms/TF is plain flash-attn on the same shapes -- a reference point, not a comparison.")
+    emit("AITER'S CAUSAL ALiBi IS NOT TRUSTWORTHY ON THIS BUILD. varlen+causal+alibi faults the GPU")
+    emit("and aborts the process, so those rows never call aiter (nan). dense/splitk causal DO run")
+    emit("but return a wrong answer (cos 0.964 vs fp32; see verify_flash_attn_alibi.py) -- they are")
+    emit("timed anyway, since it is the real masked alibi kernel, but treat fly/ait there as")
+    emit("indicative only. Non-causal rows are a clean like-for-like comparison.")
     emit("")
-    emit("ovh = sink_ms / base_ms, the real cost of the feature: same kernel, same work, one extra")
-    emit("epilogue term. The sink is hoisted out of the kv loop, so ovh should sit near 1.00 and")
-    emit("tend to 1.00 as S grows and the O(S^2) loop dwarfs the O(1) epilogue.")
-    emit("All three columns are timed with their samples INTERLEAVED, not one call at a time:")
-    emit("GPU clocks drift down over a run, so timing them sequentially makes whichever went first")
-    emit("look up to ~6% faster and biased ovh below 1.00 for no physical reason.")
+    emit("ovh = alibi_ms / base_ms, the real cost of the feature: same kernel, same work, one extra")
+    emit("term per score element. Unlike the sink (an epilogue term whose cost vanishes as S grows),")
+    emit("ALiBi is one sub + one fma INSIDE the kv loop with no memory traffic, so ovh should be")
+    emit("roughly flat in S. A row where ovh climbs with S is a finding.")
+    emit("All columns are timed with their samples INTERLEAVED, not one call at a time: GPU clocks")
+    emit("drift down over a run, so timing them sequentially makes whichever went first look up to")
+    emit("~6% faster and biases every ratio for no physical reason.")
     emit("GFLOP is this row's actual work (unmasked q,k pairs only). Varlen rows pack shorter")
     emit("sequences, so they do LESS work than the dense row on the same (B,seq) line -- compare")
-    emit("TFLOPS across rows, never ms. The sink adds no FLOPs, so it is not in GFLOP; read ovh.")
-    emit("vs dns = this row's sink TF / the dense row's sink TF at the same (B,seq,causal).")
-    emit("fly/ait = sink TF / aiter TF, >1.00 meaning fly is faster. It charges fly for the sink")
-    emit("epilogue that aiter never runs; divide by ovh for the no-sink-on-both ratio.")
+    emit("TFLOPS across rows, never ms. ALiBi adds no FLOPs, so it is not in GFLOP; read ovh.")
+    emit("vs dns = this row's alibi TF / the dense row's alibi TF at the same (B,seq,causal).")
+    emit("fly/ait = alibi TF / aiter TF, >1.00 meaning fly is faster.")
     emit("paged has no aiter number (aiter's paged entry point is a packed-Q batch-prefill, a")
     emit("different shape of work); judge it by vs dns.")
     emit("ms times the precompiled executable; the _launch wrapper adds a flat ~0.12 ms/call of")
@@ -542,29 +589,29 @@ if __name__ == "__main__":
                     continue
                 for causal in CAUSAL:
                     try:
-                        ms_s, ms_b, ms_a, seqlens = run_one(B, S, causal, mode)
+                        ms_l, ms_b, ms_a, seqlens = run_one(B, S, causal, mode)
                     except torch.cuda.OutOfMemoryError:
                         emit(f"{B:>3} {S:>7} {mode:>7} {int(causal):>7} | OOM")
                         torch.cuda.empty_cache()
                         continue
                     fl = flops(seqlens, causal)
-                    tf_s = (fl / 1e12) / (ms_s / 1e3)
+                    tf_l = (fl / 1e12) / (ms_l / 1e3)
                     tf_b = (fl / 1e12) / (ms_b / 1e3)
                     have_a = ms_a == ms_a  # not NaN
                     tf_a = (fl / 1e12) / (ms_a / 1e3) if have_a else float("nan")
-                    ovh = ms_s / ms_b
+                    ovh = ms_l / ms_b
                     if mode == "dense":
-                        dense_tf[(B, S, causal)] = tf_s
+                        dense_tf[(B, S, causal)] = tf_l
                     # Work-normalized, so varlen's shorter sequences do not skew it.
                     base = dense_tf.get((B, S, causal))
-                    rel = tf_s / base if base else float("nan")
-                    # tf_s / tf_a; same row's work cancels, so it is exactly ms_a / ms_s.
-                    vs_aiter = tf_s / tf_a if have_a else float("nan")
+                    rel = tf_l / base if base else float("nan")
+                    # tf_l / tf_a; same row's work cancels, so it is exactly ms_a / ms_l.
+                    vs_aiter = tf_l / tf_a if have_a else float("nan")
                     emit(
                         f"{B:>3} {S:>7} {mode:>7} {int(causal):>7} | "
                         f"{fl / 1e9:>9.1f} | "
-                        f"{ms_s:>10.4f} {ms_b:>10.4f} {ms_a:>10.4f} | "
+                        f"{ms_l:>10.4f} {ms_b:>10.4f} {ms_a:>10.4f} | "
                         f"{ovh:>6.3f}x {rel:>6.2f}x {vs_aiter:>7.2f}x | "
-                        f"{tf_s:>9.1f} {tf_b:>9.1f} {tf_a:>9.1f}"
+                        f"{tf_l:>9.1f} {tf_b:>9.1f} {tf_a:>9.1f}"
                     )
     _out_fh.close()
