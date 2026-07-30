@@ -110,13 +110,35 @@ def cos(a, b):
     return torch.nn.functional.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
 
 
-def _report(label, c_ref, mx, share, extra=""):
+# Gate thresholds. rel_l2 on bf16 sits around 0.003 on every mode here; 0.01 is
+# comfortably above that and far below what any real sink bug produces.
+REL_L2_MAX = 0.01
+LSE_ERR_MAX = 0.02
+MIN_SHARE = 0.01
+
+
+def _report(label, ref, out, share, lse_err=None):
+    """Gate a row on relative L2 (not cosine) and, where available, LSE error.
+
+    Cosine similarity is the wrong primary gate for a sink: the sink rescales O
+    per row, and cosine is scale-invariant, so a sink that is dropped or scaled
+    wrong still scores ~0.9995. Relative L2 sees the magnitude. LSE is stricter
+    still -- it is the raw log denominator, where the sink term is not normalized
+    away at all -- so it is the gate that actually pins the sink down.
+    """
+    ref_f, out_f = ref.float(), out.float()
+    rel_l2 = ((ref_f - out_f).norm() / ref_f.norm().clamp(min=1e-30)).item()
+    c_ref = cos(ref_f, out_f)
+    mx = (ref_f - out_f).abs().max().item()
     # A share this small means the row cannot distinguish a correct sink from no
     # sink at all, so treat it as a failure of the test rather than a pass.
-    ok = c_ref > 0.999 and share > 0.01
+    ok = rel_l2 < REL_L2_MAX and share > MIN_SHARE
+    if lse_err is not None:
+        ok = ok and lse_err < LSE_ERR_MAX
+    extra = "" if lse_err is None else f" lse_err={lse_err:.5f}"
     print(
-        f"{label} | cos_ref={c_ref:.6f} maxabs={mx:.4f} sink_share={share * 100:5.1f}%{extra}"
-        f"{'' if ok else '   <-- ACC FAIL'}",
+        f"{label} | rel_l2={rel_l2:.5f} cos={c_ref:.6f} maxabs={mx:.4f} "
+        f"sink_share={share * 100:5.1f}%{extra}{'' if ok else '   <-- ACC FAIL'}",
         flush=True,
     )
     torch.cuda.empty_cache()
@@ -179,10 +201,10 @@ def run(b_, s_, h_, h_kv, causal, share):
     lse_err = (ref_lse - lse).abs().max().item()
     return _report(
         f"dense  B={b_} S={s_:>5} H={h_:>3} Hkv={h_kv:>3} causal={int(causal)}",
-        cos(ref, out),
-        (ref.float() - out.float()).abs().max().item(),
+        ref,
+        out,
         got,
-        f" | lse_err={lse_err:.5f}",
+        lse_err,
     )
 
 
@@ -241,6 +263,58 @@ def run_ablation(b_, s_, h_, h_kv, causal, share):
 
 
 # ---------------------------------------------------------------- varlen
+
+
+def run_masked_lse(b_, sq, skv, h_, sink_val):
+    """Fully-masked rows that sit inside an *active* q block must be all-sink.
+
+    Bottom-right causal with sq > skv leaves rows [0, sq - skv) with no valid key.
+    Pick sq - skv < BLOCK_M (256) so those rows share a block with valid rows:
+    a wholly masked block is short-circuited by zero_o_block_if_needed and never
+    reaches the epilogue, so only this partial case exercises fold_sink's fmax.
+    With it, such a row is O = 0 and LSE = sink; with a bare
+    l_row += exp2(sink - m_row) instead, m_row is floored to -3e38 and LSE
+    becomes +inf.
+    """
+    n_masked = sq - skv
+    assert 0 < n_masked < 256, "need a partially-masked q block"
+    q = torch.randn(b_, sq, h_, D, dtype=dtype, device="cuda")
+    k = torch.randn(b_, skv, h_, D, dtype=dtype, device="cuda")
+    v = torch.randn(b_, skv, h_, D, dtype=dtype, device="cuda")
+    sink = torch.full((h_,), sink_val, dtype=torch.float32, device="cuda")
+    out = torch.empty(b_, sq, h_, D, dtype=dtype, device="cuda")
+    # Sentinel: rows the kernel never writes stay visible instead of reading as 0.
+    lse = torch.full((b_, h_, sq), -123.0, dtype=torch.float32, device="cuda")
+
+    build_flash_attn_dualwave_swp_module(
+        num_heads=h_,
+        head_dim=D,
+        causal=True,
+        dtype_str="bf16",
+        num_kv_heads=h_,
+        cross_seqlen=True,
+        return_lse=True,
+        has_sink=True,
+    )(q, k, v, out, b_, sq, seq_len_kv=skv, sink=sink, lse=lse, stream=torch.cuda.current_stream())
+    torch.cuda.synchronize()
+
+    m_o, m_l = out[:, :n_masked].float(), lse[:, :, :n_masked]
+    rest = out[:, n_masked:].float()
+    lse_dev = (m_l - sink_val).abs().max().item()
+    ok = (
+        torch.isfinite(m_l).all().item()
+        and lse_dev < 1e-3
+        and m_o.abs().max().item() == 0.0
+        and not torch.isnan(rest).any().item()
+    )
+    print(
+        f"masked-rows B={b_} Sq={sq:>5} Skv={skv:>5} H={h_:>3} | {n_masked} fully-masked rows in an "
+        f"active block: O absmax={m_o.abs().max().item():.6f} LSE-sink maxdev={lse_dev:.5f} "
+        f"finite={torch.isfinite(m_l).all().item()}{'' if ok else '   <-- ACC FAIL'}",
+        flush=True,
+    )
+    torch.cuda.empty_cache()
+    return ok
 
 
 def ref_fp32_varlen(q, k, v, cu_q, cu_kv, causal, share):
@@ -314,8 +388,8 @@ def run_varlen(seqlens_q, seqlens_kv, h_, h_kv, causal, share):
     return _report(
         f"varlen q={str(vq):>24} kv={str(vkv) if seqlens_kv else '(self)':>24} "
         f"H={h_:>3} Hkv={h_kv:>3} causal={int(causal)}",
-        cos(ref, out),
-        (ref - out.float()).abs().max().item(),
+        ref,
+        out,
         got,
     )
 
@@ -401,8 +475,8 @@ def run_paged(b_, sq, skv, h_, h_kv, causal, layout, share):
 
     return _report(
         f"paged  {layout:>10} B={b_} Sq={sq:>5} Skv={skv:>5} H={h_:>3} Hkv={h_kv:>3} causal={int(causal)}",
-        cos(ref, out),
-        (ref - out.float()).abs().max().item(),
+        ref,
+        out,
         achieved_share(sink, lse0),
     )
 
@@ -466,8 +540,8 @@ def run_paged_varlen(vq, vkv, h_, h_kv, causal, layout, share):
 
     return _report(
         f"paged+varlen {layout:>10} q={str(vq):>22} causal={int(causal)}",
-        cos(ref, out),
-        (ref - out.float()).abs().max().item(),
+        ref,
+        out,
         achieved_share(sink, lse0),
     )
 
@@ -505,10 +579,10 @@ def run_splitk(b_, s_, h_, h_kv, causal, splits, share):
     lse_err = (ref_lse - lse).abs().max().item()
     return _report(
         f"splitk splits={splits} B={b_} S={s_:>5} H={h_:>3} Hkv={h_kv:>3} causal={int(causal)}",
-        cos(ref, out),
-        (ref - out.float()).abs().max().item(),
+        ref,
+        out,
         got,
-        f" | lse_err={lse_err:.5f}",
+        lse_err,
     )
 
 
@@ -520,6 +594,12 @@ CONFIGS = [
     (1, 1024, 16, 16, True, 0.5),
     (2, 2048, 32, 8, True, 0.25),
     (2, 2048, 32, 8, True, 0.95),
+]
+
+# (batch, Sq, Skv, num_heads, sink_value); Sq - Skv < 256 keeps the block partial
+MASKED_LSE_CONFIGS = [
+    (1, 1024, 1000, 8, 3.0),
+    (2, 1024, 924, 16, -2.0),
 ]
 
 # (batch, seq_len, num_heads, num_kv_heads, causal, sink_share)
@@ -577,6 +657,8 @@ if __name__ == "__main__":
     ok = True
     for cfg in CONFIGS:
         ok &= run(*cfg)
+    for cfg in MASKED_LSE_CONFIGS:
+        ok &= run_masked_lse(*cfg)
     for cfg in ABLATION_CONFIGS:
         ok &= run_ablation(*cfg)
     for cfg in VARLEN_CONFIGS:

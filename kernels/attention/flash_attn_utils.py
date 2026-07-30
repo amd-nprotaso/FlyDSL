@@ -3717,11 +3717,15 @@ class DualwaveSoftmaxHelper(DualwaveKernelContext):
         sink_log2 is already log2(e)-scaled by the caller, so it shares the exp2
         space of m_row.
 
-        Uses fmax + rescale rather than a bare l_row += exp2(sink_log2 - m_row):
-        a fully-masked row floors m_row to -3e38 (floor_masked_max), which would
-        make that add exp2(+inf) = inf and turn O into NaN. Taking the max keeps
-        every exponent <= 0, and such a row correctly ends up all-sink: v_o scales
-        by exp2(-inf) = 0 and l_row becomes 1, giving O = 0 and LSE = sink.
+        Uses fmax + rescale rather than a bare l_row += exp2(sink_log2 - m_row).
+        A fully-masked row floors m_row to -3e38 (floor_masked_max), so the bare
+        add evaluates exp2(+inf) = inf and stores LSE = +inf for that row (O still
+        comes out 0, since 1/inf = 0). Rows like that reach here whenever a q
+        block straddles the causal boundary -- a wholly masked block is handled
+        earlier by zero_o_block_if_needed and never gets this far, but a partially
+        masked one does. Taking the max keeps every exponent <= 0, and such a row
+        correctly ends up all-sink: v_o scales by exp2(-inf) = 0 and l_row becomes
+        1, giving O = 0 and LSE = sink.
         """
         m_new = _fmax(m_row, sink_log2, self.fm_fast)
         corr = rocdl.exp2(T.f32, as_mlir_value(_fsub(m_row, m_new, self.fm_fast)))
