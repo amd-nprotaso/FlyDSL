@@ -76,6 +76,7 @@ def build_flash_attn_dualwave_swp_module(
     return_lse=False,
     has_bias=False,
     has_alibi=False,
+    has_sink=False,
 ):
     """Build an DUALWAVE_SWP flash_attn launcher for D=64/128 bf16/f16 on gfx950.
 
@@ -86,8 +87,9 @@ def build_flash_attn_dualwave_swp_module(
     has_bias adds a dense elementwise attention bias and works on both the dense
     and varlen paths; see the HAS_BIAS block below for the per-mode shapes.
     has_alibi adds a per-head ALiBi positional bias computed analytically from a
-    slope table; see the HAS_ALIBI block below. The two are independent and may
-    be enabled together."""
+    slope table; see the HAS_ALIBI block below.
+    has_sink adds a per-head attention sink logit to the softmax denominator; see
+    the HAS_SINK block below. The three are independent and may be combined."""
     gpu_arch = get_hip_arch()
 
     if not gpu_arch.startswith("gfx950"):
@@ -148,6 +150,20 @@ def build_flash_attn_dualwave_swp_module(
     # the *within-sequence* q position, so unlike the loaded bias it must not add
     # the packed-token base q_tok_base on the varlen path.
     HAS_ALIBI = bool(has_alibi)
+    # Attention sink, matching aiter's contract (aiter/ops/mha.py fmha_fwd_with_sink_asm):
+    #   Sink is fp32, (num_heads,), and is one extra softmax logit per q head that
+    #   has no matching V row, so it only enters the denominator:
+    #       O = sum_j exp(s_j - m) v_j / (exp(sink - m) + sum_j exp(s_j - m))
+    #   It is consumed verbatim -- aiter applies no host-side scaling, so the sink
+    #   lives in the same post-sm_scale logit space the biases do and needs only
+    #   the log2(e) factor. (aiter's own module header claims a sqrt(head_dim)
+    #   conversion, but its code passes sink straight through; the comment is stale.)
+    #
+    # Unlike HAS_BIAS/HAS_ALIBI this touches no score element -- it is a single
+    # epilogue term -- so it is orthogonal to every Q mode and KV source. Split-K
+    # is the one exception: a sink must be counted exactly once, so the per-split
+    # partials stay sink-free and the combine pass folds it in (see fold_sink).
+    HAS_SINK = bool(has_sink)
     # log2(e): scores already carry 1/sqrt(D)*log2(e) from DualwaveQLoader.scale_all,
     # so the bias only needs the log2(e) factor to land in the same exp2 space.
     BIAS_LOG2E = host_math.log2(host_math.e)
@@ -173,9 +189,9 @@ def build_flash_attn_dualwave_swp_module(
         return_lse=return_lse,
     )
     traits.BLOCK_N_OUT // traits.BLOCK_N
-    # HAS_BIAS/HAS_ALIBI are not part of traits.cache_tag, so fold them in here:
-    # otherwise builds differing only in these flags alias in the JIT cache.
-    _dualwave_swp_cache_tag = (traits.cache_tag, HAS_BIAS, HAS_ALIBI)
+    # HAS_BIAS/HAS_ALIBI/HAS_SINK are not part of traits.cache_tag, so fold them in
+    # here: otherwise builds differing only in these flags alias in the JIT cache.
+    _dualwave_swp_cache_tag = (traits.cache_tag, HAS_BIAS, HAS_ALIBI, HAS_SINK)
 
     # Shared-memory layout: one 16B-aligned K/V region (K0/V0/K1/V1).
     _lds_elem_dtype = dtype_to_elem_type(traits.DTYPE_STR)
@@ -206,6 +222,7 @@ def build_flash_attn_dualwave_swp_module(
         BlockTable: fx.Tensor,
         Bias: fx.Tensor,
         AlibiSlopes: fx.Tensor,
+        Sink: fx.Tensor,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
@@ -302,6 +319,24 @@ def build_flash_attn_dualwave_swp_module(
             # Fold the negation (aiter takes positive slopes and negates internally)
             # and log2(e) in once, so each score element costs a single fma.
             _alibi_neg_slope = Vec(_alibi_raw, (1,), fx.Float32)[0] * fx.Float32(-BIAS_LOG2E)
+
+        # ---------------- Attention sink ----------------
+        # Split-K folds the sink in the combine pass instead, so skip the load here.
+        if const_expr(HAS_SINK and not traits.SPLITK):
+            _sink_div = fx.logical_divide(fx.rocdl.make_buffer_tensor(Sink), fx.make_layout(1, 1))
+            _sink_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+            _sink_v1f32 = Vec.make_type(1, fx.Float32)
+            # One fp32 sink per q head, wave-uniform, hoisted out of the kv loop.
+            # Indexed by the GQA-swizzled ctx.q_head_idx, like the ALiBi slope, so
+            # each GQA group picks up its own sink.
+            _sink_raw = fly.copy_atom_call_ssa(
+                [_sink_v1f32],
+                _sink_atom,
+                fx.slice(_sink_div, (None, fx.Int32(ctx.q_head_idx))),
+            )
+            # Into the exp2 space m_row already lives in; no 1/sqrt(D), the sink is
+            # a post-scale logit.
+            _sink_log2 = Vec(_sink_raw, (1,), fx.Float32)[0] * fx.Float32(BIAS_LOG2E)
 
         def _score_bias_half(s_h, tile_idx, h):
             """Fold the bias and/or ALiBi into one 32-column half of a score tile.
@@ -855,6 +890,11 @@ def build_flash_attn_dualwave_swp_module(
             # Epilogue C13 (compute): final P*V -> v_o holds the unnormalized output.
             v_o = gemm_helper.pv(v_p_1, v_packs_e13, v_o)
 
+            # Fold the sink into (m_row, l_row) before normalizing, so O and LSE
+            # both pick it up. Split-K defers this to the combine pass.
+            if const_expr(HAS_SINK and not traits.SPLITK):
+                m_row, l_row = softmax_helper.fold_sink(v_o, m_row, l_row, _sink_log2)
+
             # Normalize O; split-K stores normalized partials for later w_s * l_s reweighting.
             l_inv = softmax_helper.safe_l_inv(l_row)
             softmax_helper.scale_o(v_o, l_inv)
@@ -899,11 +939,12 @@ def build_flash_attn_dualwave_swp_module(
         O: fx.Tensor,  # noqa: E741
         WS: fx.Tensor,
         LSE: fx.Tensor,
+        Sink: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         stride_q_n: fx.Int32,
     ):
-        ctx = DualwaveSplitKCombineContext(traits, O, WS, batch_size, seq_len, stride_q_n, LSE=LSE)
+        ctx = DualwaveSplitKCombineContext(traits, O, WS, batch_size, seq_len, stride_q_n, LSE=LSE, Sink=Sink)
         ctx.init_types_and_constants()
         ctx.init_runtime_indices()
         ctx.init_thread_mapping(COMBINE_ROWS_PER_BLOCK, COMBINE_LANES_PER_ROW)
@@ -913,7 +954,13 @@ def build_flash_attn_dualwave_swp_module(
         combine = DualwaveSplitKCombineHelper(ctx)
         m_s, l_s = combine.load_ml_rows()
         m_max = combine.reduce_m_max(m_s)
+        # The sink is counted once, here: raise m_max to cover it before the splits
+        # are weighted, then add its weight to den (which feeds both O and LSE).
+        if const_expr(HAS_SINK):
+            m_max, sink_w = combine.fold_sink(m_max, BIAS_LOG2E)
         acc, den = combine.accumulate_splits(m_s, l_s, m_max)
+        if const_expr(HAS_SINK):
+            den = combine.add_sink_den(den, sink_w)
         if const_expr(traits.RETURN_LSE):
             combine.store_lse(m_max, den)
         o_pack = combine.pack_output(acc, den)
@@ -932,6 +979,7 @@ def build_flash_attn_dualwave_swp_module(
         BlockTable: fx.Tensor,
         Bias: fx.Tensor,
         AlibiSlopes: fx.Tensor,
+        Sink: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
@@ -974,6 +1022,7 @@ def build_flash_attn_dualwave_swp_module(
             BlockTable,
             Bias,
             AlibiSlopes,
+            Sink,
             seq_len,
             seq_len_kv,
             stride_q_n,
@@ -994,7 +1043,7 @@ def build_flash_attn_dualwave_swp_module(
         )
         if const_expr(traits.SPLITK):
             combine_rows = bs_idx * traits.NUM_HEADS_Q * sl_idx
-            flash_attn_splitk_combine_kernel(O, DebugCounts, LSE, batch_size, seq_len, stride_q_n).launch(
+            flash_attn_splitk_combine_kernel(O, DebugCounts, LSE, Sink, batch_size, seq_len, stride_q_n).launch(
                 grid=(combine_rows // COMBINE_ROWS_PER_BLOCK, 1, 1),
                 block=(COMBINE_BLOCK, 1, 1),
                 stream=stream,
@@ -1047,6 +1096,34 @@ def build_flash_attn_dualwave_swp_module(
         alibi_stride_b = alibi_slopes.stride(0) if alibi_slopes.dim() == 2 else 0
         return alibi_slopes.reshape(-1), alibi_stride_b
 
+    def _prep_sink(sink, placeholder):
+        """Validate the attention-sink table.
+
+        aiter's contract: fp32, 1D (num_heads,), consumed verbatim (no host-side
+        scaling). Indexed by q_head_idx alone, so there is no batch stride.
+        """
+        if sink is None:
+            if HAS_SINK:
+                raise ValueError(
+                    "flash_attn_dualwave_swp was built with has_sink=True but no `sink` tensor "
+                    "was provided; pass an fp32 (num_heads,) table."
+                )
+            # Only read under const_expr(HAS_SINK); placeholder matches the
+            # cu_seqlens/block_table/bias convention.
+            return placeholder
+        if not HAS_SINK:
+            # Silently ignoring this would give wrong numerics with no diagnostic.
+            raise ValueError(
+                "`sink` was provided but flash_attn_dualwave_swp was built with "
+                "has_sink=False; rebuild with has_sink=True."
+            )
+        if sink.dim() != 1 or sink.shape[0] != num_heads:
+            raise ValueError(f"sink must be 1D (num_heads={num_heads},), got shape {tuple(sink.shape)}")
+        # The kernel reads raw f32 words, so a bf16/fp16 table would be read as garbage.
+        if not sink.is_floating_point() or sink.element_size() != 4:
+            raise ValueError(f"sink must be fp32, got dtype {sink.dtype}")
+        return sink.contiguous()
+
     def _launch(
         Q,
         K,
@@ -1068,6 +1145,7 @@ def build_flash_attn_dualwave_swp_module(
         bias=None,
         bias_stride0=None,
         alibi_slopes=None,
+        sink=None,
         lse=None,
         stream=None,
     ):
@@ -1125,6 +1203,7 @@ def build_flash_attn_dualwave_swp_module(
                 bias_stride0 = bias.stride(0)
             bias = bias.view(-1)
         alibi_slopes, alibi_stride_b = _prep_alibi(alibi_slopes, O)
+        sink = _prep_sink(sink, O)
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
             if stream is None:
                 return launch_flash_attn_dualwave_swp(
@@ -1139,6 +1218,7 @@ def build_flash_attn_dualwave_swp_module(
                     block_table,
                     bias,
                     alibi_slopes,
+                    sink,
                     batch_size,
                     seq_len,
                     seq_len_kv,
@@ -1161,6 +1241,7 @@ def build_flash_attn_dualwave_swp_module(
                 block_table,
                 bias,
                 alibi_slopes,
+                sink,
                 batch_size,
                 seq_len,
                 seq_len_kv,
@@ -1194,6 +1275,7 @@ def build_flash_attn_dualwave_swp_module(
         bias=None,
         bias_stride0=None,
         alibi_slopes=None,
+        sink=None,
         lse=None,
         stream=None,
     ):
@@ -1245,6 +1327,7 @@ def build_flash_attn_dualwave_swp_module(
                 bias_stride0 = bias.stride(0)
             bias = bias.view(-1)
         alibi_slopes, alibi_stride_b = _prep_alibi(alibi_slopes, O)
+        sink = _prep_sink(sink, O)
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
             return flyc.compile(
                 launch_flash_attn_dualwave_swp,
@@ -1259,6 +1342,7 @@ def build_flash_attn_dualwave_swp_module(
                 block_table,
                 bias,
                 alibi_slopes,
+                sink,
                 batch_size,
                 seq_len,
                 seq_len_kv,
