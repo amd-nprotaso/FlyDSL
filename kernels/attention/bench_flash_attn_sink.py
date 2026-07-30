@@ -62,7 +62,7 @@ import sys
 import torch
 
 import flydsl.expr as fx
-from kernels.attention.flash_attn_gfx950 import build_flash_attn_dualwave_swp_module
+from kernels.attention.flash_attn_gfx950_new import build_flash_attn_dualwave_swp_module
 from kernels.attention.flash_attn_utils import dualwave_splitk_workspace_elems
 
 try:

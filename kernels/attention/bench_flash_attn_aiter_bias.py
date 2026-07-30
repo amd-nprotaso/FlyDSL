@@ -71,7 +71,7 @@ import sys
 import torch
 
 import flydsl.expr as fx
-from kernels.attention.flash_attn_gfx950 import build_flash_attn_dualwave_swp_module
+from kernels.attention.flash_attn_gfx950_new import build_flash_attn_dualwave_swp_module
 from kernels.attention.flash_attn_utils import dualwave_splitk_workspace_elems
 
 try:
@@ -316,6 +316,7 @@ def make_args(B, S, inp, stream):
         inp["block_table"] if inp["block_table"] is not None else out,
         inp["bias"].contiguous().view(-1),
         out,  # AlibiSlopes: this build is has_alibi=False, so it is never read
+        out,  # Sink: this build is has_sink=False, so it is never read
         B,
         S,  # seq_len (varlen: max_seqlen_q, which sizes grid_y)
         S,  # seq_len_kv

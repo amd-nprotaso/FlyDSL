@@ -11,6 +11,85 @@ and (at runtime) seq_len >= 384. seq_len need NOT be a multiple of 256/64: a
 partial last q-block and a partial/odd kv-tile count are handled the same way as
 the hand-written reference asm (num_records bound on Q/K/V/O, tile count rounded
 up to even, and a kv padding-mask on the non-causal path).
+
+Variant of ``flash_attn_gfx950.py`` carrying register-pressure patches for the
+bias/ALiBi/sink paths. Same public API (``build_flash_attn_dualwave_swp_module``)
+and same numerics -- verified against the bias, ALiBi and sink reference suites.
+Differences from the base module, both in ``build_flash_attn_dualwave_swp_module``:
+
+  sink load deferred   The per-head sink logit is loaded at its fold_sink use
+                       site instead of at kernel entry, so it is not live across
+                       the software pipeline. D=64 bias+alibi+sink 202 -> 194
+                       VGPRs; standalone sink unchanged.
+  bias loads batched   All BIAS_GROUPS loads for a score half are issued before
+                       any is consumed, taking the main loop from 16 s_waitcnt
+                       vmcnt(0) drains per iteration to 4. Neutral on registers
+                       and on wall clock (0.996x geomean over 56 shapes); kept
+                       because the drains also stalled the KV DMA prefetch.
+  packed bias fold     Each BIAS_GROUPS group is folded with one vector fma
+                       instead of _BIAS_VEC scalar ones, so the whole fold packs
+                       into v_pk_fma_f32 (v_fmamk_f32 45 -> 0, v_pk_fma_f32
+                       70 -> 94 on D=128 dense). Bitwise identical; VGPRs
+                       256 -> 250, SGPRs 59 -> 50, and the 2 cold spills below
+                       go to 0. 1.007x geomean over 24 shapes (dense/varlen/
+                       paged/splitk x seq 2048/4096/8192 x causal).
+
+None of these moves the headline number. What bias actually costs is VALU
+throughput in the score fold (~160 ops per loop iteration against 64 MFMAs,
+measured 1.67x on D=128 seq=8192 with the bias resident in cache), and that fold
+is emitted after the QK MFMA chain rather than interleaved into it. Hiding it
+under the matrix pipe is the open work; register pressure is not the lever.
+
+The fold is 2 VALU per score element and, after the packed fold above, two
+thirds of that is the bf16 -> f32 widen (v_and + v_lshlrev, 1 op per element)
+rather than the multiply-add (now 0.5). The widen is at its floor on gfx950:
+there is no v_cvt_pk_f32_bf16, and the scalar v_cvt_f32_bf16 runs at the same
+1 op per element. So packing is closed as a direction -- what is left is
+scheduling, not instruction selection.
+
+Any such scheduling has to be live-state neutral, because there is almost no
+register headroom and none of it is where it looks. D=128 sits at 250 registers
+against a hard 256, and the 256 is an occupancy cliff, not an ISA limit:
+
+  registers  gfx950 has a *unified* 512-register file. .amdhsa_next_free_vgpr
+             is arch VGPRs + AGPRs together (llc on a kernel with 60 arch + 32
+             acc reports vgpr_count 92, accum_offset 60, agpr_count 32), so
+             AGPRs are not a free second bank -- agpr_count 0 means the 256
+             "spare" AGPRs do not exist, they are the same registers. 250
+             granulates to 256 and 512/256 = 2 waves/SIMD; 282 would granulate
+             to 288 and give 1. Staging bias anywhere, VGPR or AGPR, costs the
+             occupancy.
+  LDS        68096 B/workgroup against 160KB = 2 workgroups/CU.
+
+Both land on occupancy 2 exactly, so the two limits are balanced and 6
+registers is the entire budget. This is also why the compiler chose 2 cold
+spills over 258 registers before the packed fold, and the likely reason
+hoisting the bias load ahead of the MFMA chain measured ~18% slower on the
+sibling SWA kernel -- it bought latency hiding and paid a wave of occupancy.
+
+The one restructure that costs no live state is splitting the two QK accumulator
+chains so each half's fold can overlap the other half's MFMAs; qk_scored does
+this and is where the remaining detail lives. It is worth more than the packed
+fold (1.026x vs 1.007x geomean on the same 24 shapes) and it *lowers* registers
+to 242, because k_lo dies at the end of the lo chain instead of surviving the
+interleaved one.
+
+Still open, in rough order of expected value:
+
+  fold packing     The split-chain scheduler unpacks 12 of the v_pk_fma_f32 back
+  under interleave into 24 scalar v_fma_f32 (94 -> 82) to get the overlap. Both
+                   effects are wanted; recovering the packing would be worth ~12
+                   instructions per unrolled body. There are now 14 registers of
+                   headroom (242 against the 256 cliff) to pay for it.
+  sched_group      The _sched_barrier_pairs counts in clusters 1/5 (6,3 and 10,5)
+  retune           were tuned for the fold-after-chain order and the no-bias VALU
+                   mix. They still name the right number of MFMAs, but the VALU
+                   counts no longer describe what is actually available to
+                   interleave.
+  hi-half fold     Only the lo fold overlaps MFMAs; the hi fold still lands after
+                   the last MFMA with nothing behind it. Finer splitting (lo, hi
+                   first half, lo fold, hi second half, hi fold) would give it a
+                   window, at the cost of a more tangled emission order.
 """
 
 import math as host_math
@@ -37,7 +116,9 @@ from kernels.attention.flash_attn_utils import (
     _anchor_v_o,
     _anchor_v_p,
     _dualwave_sync_barrier,
+    _get_q_pack,
     _make_dualwave_swp_traits,
+    _mfma_acc,
     _s_barrier,
     _s_nop,
     _s_setprio,
@@ -126,7 +207,7 @@ def build_flash_attn_dualwave_swp_module(
     #           so tile j always covers logical KV [j*BLOCK_N, (j+1)*BLOCK_N).
     #           Paging redirects where KV *data* is fetched, never the bias column.
     #   split-K each split folds the bias over its own absolute tile range; the
-    #           combine pass merges already-biased partials. Every add_score_bias call
+    #           combine pass merges already-biased partials. Every qk_scored call
     #           site must therefore pass an absolute (split_t0-relative) tile index.
     HAS_BIAS = bool(has_bias)
     # ALiBi, matching aiter's contract (ck-tile block_position_encoding.hpp):
@@ -294,7 +375,10 @@ def build_flash_attn_dualwave_swp_module(
                 _bias_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), ctx.elem_dtype)
             _BIAS_GROUPS = 16 // _BIAS_VEC
             _bias_vec_ty = Vec.make_type(_BIAS_VEC, ctx.elem_dtype)
-            _bias_log2e = fx.Float32(BIAS_LOG2E)
+            # Splat, not a scalar: the fold multiplies a whole _BIAS_VEC group at
+            # once so the constant lands in a register pair instead of a VOP2
+            # literal, which is what lets the fma pack (see _score_bias_half).
+            _bias_log2e = Vec.filled(_BIAS_VEC, BIAS_LOG2E, fx.Float32)
             # Varlen packs every batch's rows into one (total_q, max_seqlen_kv)
             # matrix, so this batch's rows start at cu_seqlens_q[b]. Dense
             # broadcasts one matrix over batch, so its row base is 0 and the
@@ -323,20 +407,34 @@ def build_flash_attn_dualwave_swp_module(
         # ---------------- Attention sink ----------------
         # Split-K folds the sink in the combine pass instead, so skip the load here.
         if const_expr(HAS_SINK and not traits.SPLITK):
-            _sink_div = fx.logical_divide(fx.rocdl.make_buffer_tensor(Sink), fx.make_layout(1, 1))
-            _sink_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-            _sink_v1f32 = Vec.make_type(1, fx.Float32)
-            # One fp32 sink per q head, wave-uniform, hoisted out of the kv loop.
-            # Indexed by the GQA-swizzled ctx.q_head_idx, like the ALiBi slope, so
-            # each GQA group picks up its own sink.
-            _sink_raw = fly.copy_atom_call_ssa(
-                [_sink_v1f32],
-                _sink_atom,
-                fx.slice(_sink_div, (None, fx.Int32(ctx.q_head_idx))),
-            )
-            # Into the exp2 space m_row already lives in; no 1/sqrt(D), the sink is
-            # a post-scale logit.
-            _sink_log2 = Vec(_sink_raw, (1,), fx.Float32)[0] * fx.Float32(BIAS_LOG2E)
+
+            def _load_sink_log2():
+                """Load this head's sink logit, in exp2 space.
+
+                Called at the fold_sink site rather than hoisted to kernel entry:
+                the sink is consumed once, after the kv loop, so hoisting the load
+                keeps its value live across the whole software pipeline for no
+                benefit. Deferring it costs nothing (the load is wave-uniform and
+                off the critical path) and measurably relieves the register
+                allocator when the sink is combined with bias/ALiBi -- on D=64
+                bias+alibi+sink drops 202 -> 194 VGPRs. Standalone sink is
+                unchanged at 170, so the remaining +8 is fold_sink's own epilogue
+                work, not this load.
+                """
+                _sink_div = fx.logical_divide(fx.rocdl.make_buffer_tensor(Sink), fx.make_layout(1, 1))
+                _sink_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+                _sink_v1f32 = Vec.make_type(1, fx.Float32)
+                # One fp32 sink per q head, wave-uniform. Indexed by the
+                # GQA-swizzled ctx.q_head_idx, like the ALiBi slope, so each GQA
+                # group picks up its own sink.
+                _sink_raw = fly.copy_atom_call_ssa(
+                    [_sink_v1f32],
+                    _sink_atom,
+                    fx.slice(_sink_div, (None, fx.Int32(ctx.q_head_idx))),
+                )
+                # Into the exp2 space m_row already lives in; no 1/sqrt(D), the sink
+                # is a post-scale logit.
+                return Vec(_sink_raw, (1,), fx.Float32)[0] * fx.Float32(BIAS_LOG2E)
 
         def _score_bias_half(s_h, tile_idx, h):
             """Fold the bias and/or ALiBi into one 32-column half of a score tile.
@@ -385,34 +483,87 @@ def build_flash_attn_dualwave_swp_module(
                 if const_expr(VARLEN):
                     bias_row_i32 = bias_row_i32 + _bias_row_base_i32
                 base = bias_row_i32 * fx.Int32(bias_stride0) + col_base_h
+                # Issue every group's load before consuming any. Consuming a load
+                # right after issuing it makes the compiler emit s_waitcnt vmcnt(0)
+                # after each one; because vmcnt retires in order, that also drains
+                # the KV DMA prefetches this cluster still has in flight. Batching
+                # the issues takes the main loop from 16 vmcnt(0) drains per
+                # iteration down to 4, at no cost in registers or instruction count.
+                #
+                # This is a codegen-hygiene fix, not a speedup: measured 0.996x
+                # geomean over 56 shapes, i.e. neutral. The drains were not what
+                # bias costs -- that is VALU throughput in the fold below, which
+                # does not overlap the QK MFMA chain it depends on.
+                _raws = []
                 for g in range_constexpr(_BIAS_GROUPS):
                     col_off = _seq_pad_score_threshold(traits, g * _BIAS_VEC)
-                    raw = fly.copy_atom_call_ssa(
-                        [_bias_vec_ty],
-                        _bias_atom,
-                        fx.slice(_bias_div, (None, base + fx.Int32(col_off))),
+                    _raws.append(
+                        fly.copy_atom_call_ssa(
+                            [_bias_vec_ty],
+                            _bias_atom,
+                            fx.slice(_bias_div, (None, base + fx.Int32(col_off))),
+                        )
                     )
+                for g in range_constexpr(_BIAS_GROUPS):
                     # Widen one group at a time: widening all 16 up front keeps a 16-VGPR
                     # temporary live and measured ~12% slower on the sibling SWA kernel.
-                    bv = Vec(Vec(raw, (_BIAS_VEC,), ctx.elem_dtype).to(fx.Float32))
+                    bv = Vec(Vec(_raws[g], (_BIAS_VEC,), ctx.elem_dtype).to(fx.Float32))
+                    # Fold a whole group as one vector fma rather than element by
+                    # element. Scalar fmas here come out as v_fmamk_f32, which
+                    # encodes log2e as a VOP2 inline literal -- cheaper than a
+                    # register for one element, but it blocks VOP3P, and the
+                    # element-wise widen leaves the bias in unaligned VGPRs that
+                    # a packed op would have to re-pair with movs. Going through
+                    # a vector fma gives aligned operands and a splat constant,
+                    # so all of these become v_pk_fma_f32: v_fmamk_f32 45 -> 0,
+                    # v_pk_fma_f32 70 -> 94 on D=128 dense. Bitwise identical.
+                    r0 = g * _BIAS_VEC
+                    acc = Vec.from_elements([out[r0 + e] for e in range_constexpr(_BIAS_VEC)], fx.Float32)
+                    fused = fmath.fma(bv, _bias_log2e, acc)
                     for e in range_constexpr(_BIAS_VEC):
-                        r = g * _BIAS_VEC + e
-                        out[r] = fmath.fma(bv[e], _bias_log2e, out[r])
+                        out[r0 + e] = fused[e]
 
             return Vec.from_elements(out, fx.Float32)
 
-        def add_score_bias(v_s, tile_idx):
-            """Add the bias and/or ALiBi to a QK score pair, before any masking.
+        def qk_scored(v_k, q_all_scaled_bf16, tile_idx):
+            """QK MFMAs with each half's score fold emitted before the other half's chain.
 
-            Added after the QK MFMAs rather than seeded into the MFMA accumulator.
-            For the loaded bias, seeding is free in principle but puts the load ahead
-            of the MFMA chain instead of under it, and measured ~18% slower on the
-            sibling SWA kernel. For ALiBi the fma already absorbs the accumulate, so
-            seeding would not save an instruction either.
+            The fold is added after the QK MFMAs rather than seeded into the MFMA
+            accumulator. Seeding is free in principle -- MFMA is D = A*B + C -- but
+            it saves nothing: the fold is one fma per element either way (seeding
+            turns the fma into a mul, same VALU cost), and it puts the bias load
+            ahead of the MFMA chain instead of under it, which measured ~18% slower
+            on the sibling SWA kernel. For ALiBi the fma already absorbs the
+            accumulate, so seeding would not save an instruction there either.
+
+            What does help is *where* the fold lands. gemm_helper.qk interleaves the
+            two accumulator chains (lo, hi, lo, hi, ...), so both halves only finish
+            at the very last MFMA and the whole fold is forced after the whole chain.
+            Splitting them -- all K_STEPS_QK lo MFMAs, lo fold, all hi MFMAs, hi fold
+            -- lets the lo fold's VALU overlap the hi half's MFMAs.
+
+            This is live-state neutral, which is the binding constraint here (see the
+            occupancy note in the module docstring): load_k already materializes all
+            2*K_STEPS_QK K packs before qk() runs, so peak pressure is unchanged, and
+            k_lo dies at the end of the lo chain -- freeing registers exactly where
+            the lo fold wants them. Measured 242 VGPRs against 250 for the
+            fold-after-chain order, and 1.026x geomean over the same 24 shapes.
             """
             if const_expr(not (HAS_BIAS or HAS_ALIBI)):
-                return v_s
-            return (_score_bias_half(v_s[0], tile_idx, 0), _score_bias_half(v_s[1], tile_idx, 1))
+                return gemm_helper.qk(v_k, q_all_scaled_bf16)
+            out_halves = []
+            for h, k_h in ((0, v_k[0]), (1, v_k[1])):
+                acc = gemm_helper.c_zero_v16f32
+                for ks in range_constexpr(traits.K_STEPS_QK):
+                    acc = _mfma_acc(
+                        k_h[ks],
+                        _get_q_pack(traits, q_all_scaled_bf16, ks),
+                        acc,
+                        gemm_helper.mma_atom,
+                        gemm_helper.mfma_acc_vec_type,
+                    )
+                out_halves.append(_score_bias_half(acc, tile_idx, h))
+            return (out_halves[0], out_halves[1])
 
         def _main_body():
             # Paged: stage the block-table row into LDS before any page-id ds_read.
@@ -460,10 +611,9 @@ def build_flash_attn_dualwave_swp_module(
             # Prologue scores + first softmax pass for KV tile 0
             if const_expr(traits.PAGED):
                 pro_pageid_2_lds = page_ids.load_page_id_lds(page_ids.split_tile(2))
-            v_s_0 = gemm_helper.qk(v_k, q_all_scaled_bf16)
-            # Absolute tile index, like every other add_score_bias site: under split-K this
+            # Absolute tile index, like every other fold site: under split-K this
             # split's prologue tile is split_t0, not 0. Folds to 0 when not SPLITK.
-            v_s_0 = add_score_bias(v_s_0, ctx.split_tile(0))
+            v_s_0 = qk_scored(v_k, q_all_scaled_bf16, ctx.split_tile(0))
             _sched_barrier(0)
 
             if const_expr(traits.CAUSAL):
@@ -540,8 +690,7 @@ def build_flash_attn_dualwave_swp_module(
                 # Cluster 1 computes MMA0, finishes v_p_0 softmax, updates l_row, and casts P.
                 if const_expr(traits.PAGED):
                     c2_pageid_lds = page_ids.load_page_id_lds(j_idx)
-                v_s_1 = gemm_helper.qk(v_k, q_all_scaled_bf16)
-                v_s_1 = add_score_bias(v_s_1, j_idx - 2)
+                v_s_1 = qk_scored(v_k, q_all_scaled_bf16, j_idx - 2)
                 v_p_0 = softmax_helper.exp2(v_p_0, 16, 16)
                 l_row = softmax_helper.reduce_sum(l_row, v_p_0)
                 v_p_0 = softmax_helper.cast_p(v_p_0)
@@ -616,8 +765,7 @@ def build_flash_attn_dualwave_swp_module(
                 # Cluster 5 mirrors C1: MMA0, finish v_p_1 softmax, update l_row, and cast P.
                 if const_expr(traits.PAGED):
                     _c6_kpid_lds = page_ids.load_page_id_lds(j_idx + 1)
-                v_s_0 = gemm_helper.qk(v_k, q_all_scaled_bf16)
-                v_s_0 = add_score_bias(v_s_0, j_idx - 1)
+                v_s_0 = qk_scored(v_k, q_all_scaled_bf16, j_idx - 1)
                 v_p_1 = softmax_helper.exp2(v_p_1, 16, 16)
                 l_row = softmax_helper.reduce_sum(l_row, v_p_1)
                 v_p_1 = softmax_helper.cast_p(v_p_1)
@@ -708,8 +856,7 @@ def build_flash_attn_dualwave_swp_module(
             # Epilogue C1 (compute): MMA0 -> v_s_1; finish v_p_0 softmax (like C1).
             if const_expr(traits.PAGED):
                 ec2_pageid_lds = page_ids.load_page_id_lds(max_m1)
-            v_s_1 = gemm_helper.qk(v_k, q_all_scaled_bf16)
-            v_s_1 = add_score_bias(v_s_1, max_m3)
+            v_s_1 = qk_scored(v_k, q_all_scaled_bf16, max_m3)
             v_p_0 = softmax_helper.exp2(v_p_0, 16, 16)
             l_row = softmax_helper.reduce_sum(l_row, v_p_0)
             v_p_0 = softmax_helper.cast_p(v_p_0)
@@ -776,8 +923,7 @@ def build_flash_attn_dualwave_swp_module(
             _dualwave_sync_barrier()
 
             # Epilogue C5 computes MMA0, folds rescale_e3 into l_row, and finishes v_p_1 softmax.
-            v_s_0 = gemm_helper.qk(v_k, q_all_scaled_bf16)
-            v_s_0 = add_score_bias(v_s_0, max_m2)
+            v_s_0 = qk_scored(v_k, q_all_scaled_bf16, max_m2)
             l_row = softmax_helper.apply_l_rescale(l_row, rescale_e3)
             v_p_1 = softmax_helper.exp2(v_p_1, 16, 16)
             l_row = softmax_helper.reduce_sum(l_row, v_p_1)
@@ -836,8 +982,7 @@ def build_flash_attn_dualwave_swp_module(
             _dualwave_sync_barrier()
 
             # Epilogue C9 computes the last-tile MMA0, folds rescale_e7 into l_row, and finishes v_p_0.
-            v_s_1 = gemm_helper.qk(v_k, q_all_scaled_bf16)
-            v_s_1 = add_score_bias(v_s_1, max_m1)
+            v_s_1 = qk_scored(v_k, q_all_scaled_bf16, max_m1)
             l_row = softmax_helper.apply_l_rescale(l_row, rescale_e7)
             v_p_0 = softmax_helper.exp2(v_p_0, 16, 16)
             l_row = softmax_helper.reduce_sum(l_row, v_p_0)
@@ -893,7 +1038,7 @@ def build_flash_attn_dualwave_swp_module(
             # Fold the sink into (m_row, l_row) before normalizing, so O and LSE
             # both pick it up. Split-K defers this to the combine pass.
             if const_expr(HAS_SINK and not traits.SPLITK):
-                m_row, l_row = softmax_helper.fold_sink(v_o, m_row, l_row, _sink_log2)
+                m_row, l_row = softmax_helper.fold_sink(v_o, m_row, l_row, _load_sink_log2())
 
             # Normalize O; split-K stores normalized partials for later w_s * l_s reweighting.
             l_inv = softmax_helper.safe_l_inv(l_row)
