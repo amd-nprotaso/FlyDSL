@@ -44,10 +44,18 @@ Columns:
             hoisted out of the kv loop, so its overhead vanishes as S grows --
             ALiBi costs one sub plus one fma on EVERY score element, inside the
             kv loop, with no memory traffic (absf lowers to a VOP3 source
-            modifier). That is O(S^2) work against an O(S^2) kernel, so ovh
-            should be roughly FLAT in S, not decaying toward 1.00. A row where
-            ovh climbs with S is a finding; a row near 1.00 means the fold hid
-            behind the MFMA chain.
+            modifier). That is O(S^2) work against an O(S^2) kernel, so ovh is
+            FLAT in S rather than decaying toward 1.00. Measured on gfx950 over
+            B=1..3, it plateaus from S~4096 at
+
+                ~1.16-1.20  non-causal      ~1.30-1.34  causal
+
+            in every mode, so ALiBi is not a free fold: it is a real 16-34% tax
+            that does not amortize. Treat those as the baseline -- a row drifting
+            above its band is a regression, and the causal band sitting well
+            above the non-causal one is an open question, not an explained
+            result. Below S~2048 ovh is noisier (1.21-1.45) because the fold no
+            longer hides behind a long MFMA chain.
   vs dns    this row's alibi TF over the *dense* alibi TF at the same (B, seq,
             causal). Work-normalized, so it is meaningful for every mode
             including varlen, and it is the only baseline paged rows get.
@@ -564,8 +572,10 @@ if __name__ == "__main__":
     emit("")
     emit("ovh = alibi_ms / base_ms, the real cost of the feature: same kernel, same work, one extra")
     emit("term per score element. Unlike the sink (an epilogue term whose cost vanishes as S grows),")
-    emit("ALiBi is one sub + one fma INSIDE the kv loop with no memory traffic, so ovh should be")
-    emit("roughly flat in S. A row where ovh climbs with S is a finding.")
+    emit("ALiBi is one sub + one fma INSIDE the kv loop with no memory traffic, so ovh is flat in S,")
+    emit("not decaying: measured plateau from S~4096 is ~1.16-1.20 non-causal, ~1.30-1.34 causal, in")
+    emit("every mode. ALiBi is a real 16-34% tax that never amortizes; a row above its band is a")
+    emit("regression. Why causal costs consistently more is an open question, not an explained one.")
     emit("All columns are timed with their samples INTERLEAVED, not one call at a time: GPU clocks")
     emit("drift down over a run, so timing them sequentially makes whichever went first look up to")
     emit("~6% faster and biases every ratio for no physical reason.")
