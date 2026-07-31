@@ -240,9 +240,9 @@ def run_ablation(b_, s_, h_, h_kv, causal, share):
     )(q, k, v, out_sink, b_, s_, sink=sink, stream=torch.cuda.current_stream())
 
     out_plain = torch.empty(b_, s_, h_, D, dtype=dtype, device="cuda")
-    build_flash_attn_dualwave_swp_module(
-        num_heads=h_, head_dim=D, causal=causal, dtype_str="bf16", num_kv_heads=h_kv
-    )(q, k, v, out_plain, b_, s_, stream=torch.cuda.current_stream())
+    build_flash_attn_dualwave_swp_module(num_heads=h_, head_dim=D, causal=causal, dtype_str="bf16", num_kv_heads=h_kv)(
+        q, k, v, out_plain, b_, s_, stream=torch.cuda.current_stream()
+    )
     torch.cuda.synchronize()
 
     ratio = (out_sink.float().norm() / out_plain.float().norm()).item()
