@@ -208,3 +208,45 @@ def test_conv1d_vs_torch(s, stride, padding):
 
     assert y.shape == y_ref.shape
     assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# matmul_1x1=False keeps an unstrided unpadded 1x1 filter in the kernel instead of
+# letting the pure-channel-GEMM fast path forward it to torch.matmul.
+@_skip_non_cdna4
+@pytest.mark.parametrize("rank", [1, 2, 3])
+def test_1x1_stays_in_the_kernel(rank):
+    torch.manual_seed(7000 + rank)
+    n, c, k = 2, 64, 128
+    spatial = {1: (96,), 2: (24, 28), 3: (6, 12, 16)}[rank]
+    x = torch.randn((n, c, *spatial), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c, *([1] * rank)), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((k,), device="cuda", dtype=torch.float32)
+
+    y = conv3d_implicit(x, weight, bias=bias, matmul_1x1=False)
+    y_ref = {1: F.conv1d, 2: F.conv2d, 3: F.conv3d}[rank](x, weight, bias=bias.to(torch.bfloat16))
+    torch.cuda.synchronize()
+
+    assert y.shape == y_ref.shape
+    assert torch.allclose(y, y_ref, rtol=2e-2, atol=2e-2)
+
+
+# An input above 2**31 elements takes the BIG_IN path, which rebases the gather's buffer
+# descriptor onto each block's own origin so a 32-bit voffset still reaches the tile. A
+# 1x1 filter also takes the temporal-only gather, and that pair used to drop the rebase's
+# H component whenever ho*wo was a whole multiple of TILE_M, reading the wrong rows.
+@_skip_non_cdna4
+@pytest.mark.large_shape
+def test_1x1_over_2gi_elements():
+    torch.manual_seed(7100)
+    n, c, h, w, k = 1, 128, 4096, 4096, 16  # 2**31 elements, ho*wo % TILE_M == 0
+    x = torch.randn((n, c, h, w), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((k, c, 1, 1), device="cuda", dtype=torch.bfloat16)
+
+    y = conv3d_implicit(x, weight, matmul_1x1=False)
+    torch.cuda.synchronize()
+
+    assert y.shape == (n, k, h, w)
+    # Rows far apart in H land in differently-rebased blocks; check both ends.
+    for h0 in (0, h // 2, h - 8):
+        y_ref = F.conv2d(x[:, :, h0 : h0 + 8], weight)
+        assert torch.allclose(y[:, :, h0 : h0 + 8], y_ref, rtol=2e-2, atol=2e-2)

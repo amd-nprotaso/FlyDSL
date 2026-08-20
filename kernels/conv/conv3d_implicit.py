@@ -19,6 +19,9 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import rocdl as rocdl_ods
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -52,7 +55,25 @@ DEFAULT_TILE = (128, 128, 2, 4)
 
 TILE_LADDER = ((128, 128, 2, 4), (64, 64, 2, 2), (32, 32, 1, 2))
 
+# The bandwidth-bound rung, widest first. What every entry buys is a TILE_N that spans
+# K/groups in one step. The x grid axis is dispatched first, so all of one N tile's M
+# blocks run before the next N tile starts and none of the activation survives in cache
+# between them: a second N tile is a second full pass over the input. These cost up to
+# 128KB of LDS, so the rung is filtered against the device budget before it is used.
+TILE_LADDER_WIDE = ((256, 256, 2, 4), (128, 256, 2, 4), (256, 128, 2, 4))
+
+# Fallback when K/groups is wider than any tile: swizzle the grid so the N tiles run over
+# the same rows at the same time and share them in cache instead. Recovers most, not all,
+# of what the wide tile would have (measured 189us -> 159us where the tile gives 144us).
+TILE_WIDE_WGM = 8
+
 TILE_MIN_WAVES_PER_CU = 6
+
+# Machine flop:byte ratio above which the MFMAs, not DRAM, set the kernel's time. The true
+# ridge point is ~245 on CDNA3 and ~460 on CDNA4; one constant in between classifies every
+# shape measured, the nearest being 2x away on either side, so the rung below does not have
+# to know which chip it is running on.
+TILE_RIDGE_FLOP_PER_BYTE = 300
 
 PADDING_MODES = ("zeros", "reflect", "replicate", "circular")
 
@@ -78,9 +99,25 @@ def _autotune_enabled():
 
 _WEIGHT_CACHE = {}
 
+_BIAS_PLACEHOLDER = {}
+
 
 def _pad_channels(c):
     return (c + LDG_VEC - 1) // LDG_VEC * LDG_VEC
+
+
+def _bias_placeholder(device):
+    """The stand-in passed for ``bias`` when there is none.
+
+    The kernel only builds a bias resource under ``const_expr(has_bias)``, so nothing
+    ever reads this; one shared tensor per device keeps a small-shape conv from paying
+    for an allocation the GPU will not touch.
+    """
+    t = _BIAS_PLACEHOLDER.get(device)
+    if t is None:
+        t = torch.empty(1, device=device, dtype=torch.float32)
+        _BIAS_PLACEHOLDER[device] = t
+    return t
 
 
 # Layout names accepted per spatial rank.
@@ -119,6 +156,76 @@ def _big_in(n, c, groups, d, h, w, pt, ph, pw):
     """Whether the kernel's 64-bit BIG_IN address path would engage for this input."""
     cp = _pad_channels(c // groups) * groups
     return n * cp * (d + 2 * pt) * (h + 2 * ph) * (w + 2 * pw) > 0x7FFFFFFF
+
+
+# --- reading an NCDHW input directly, instead of pre-transposing it to NDHWC ---
+#
+# Both MFMA operands want K contiguous per lane, and an NCDHW activation is contiguous
+# along the output rows instead, so something has to transpose. `_ncdhw_to_ndhwc` does it
+# in a separate pass over HBM; for a filter with taps to reuse that is amortized, but a
+# 1x1 filter reads every input element exactly once and the extra pass costs more than
+# the convolution (536MB against a 403MB problem on 1,512,512,512 x 256,512,1,1).
+#
+# gfx950 can do it for free on the way out of LDS instead. `ds_read_tr16_b64` redistributes
+# a 128-byte LDS run across a 16-lane group, so if a run holds 4 K values of 16 M rows,
+# K-major, one instruction hands each lane 4 consecutive K of one row. The DMA then only
+# has to fill runs, which it can do straight from NCDHW: a run's 16 M rows at one channel
+# are 16 consecutive input elements.
+#
+# A wave's `buffer_load_lds` writes 8 runs, and those runs have to be 8 M blocks of the
+# same K group for the DMA to stay coalesced, hence the floor on TILE_M.
+NCHW_A_MIN_TILE_M = 128
+
+
+@functools.lru_cache(maxsize=1)
+def _has_lds_read_transpose():
+    """Whether the GPU has the gfx950 ds_read_tr16 LDS transpose."""
+    try:
+        from flydsl.runtime.device import get_rocm_arch
+
+        return str(get_rocm_arch()).startswith("gfx95")
+    except Exception:
+        return False
+
+
+def _nchw_a_ok(in_ndhwc, n, c, d, h, w, kt, kh, kw, st, sh, sw, pt, ph, pw, pad_mode):
+    """Whether the kernel can read this NCDHW input as-is, skipping the pre-transpose.
+
+    Only a 1x1x1 unit-stride unpadded filter qualifies, which is both where the transpose
+    hurts most and where the A row is the output row: no im2col gather, so a lane's LDS
+    run maps to one contiguous span of the input. Everything else keeps the NDHWC path.
+    """
+    return (
+        not in_ndhwc
+        and _has_lds_read_transpose()
+        and (kt, kh, kw) == (1, 1, 1)
+        and (st, sh, sw) == (1, 1, 1)
+        and (pt, ph, pw) == (0, 0, 0)
+        and pad_mode == "zeros"
+        # The gather addresses the input with a 32-bit element offset -- BIG_IN's rebased
+        # descriptor assumes NDHWC row order and does not carry over.
+        and n * c * d * h * w <= 0x7FFFFFFF
+        # A thread DMAs LDG_VEC consecutive output rows at one channel, so a batch
+        # boundary inside that span would silently roll over into the next channel.
+        and (n == 1 or (d * h * w) % LDG_VEC == 0)
+    )
+
+
+def _lds_read_transpose_frag(result_type, lds_byte_addr, run_stride_bytes):
+    """One 8-element MFMA A fragment, read out of a transposed LDS tile (gfx950).
+
+    ``ds_read_tr16_b64`` needs a 16-lane group's addresses to cover one 128-byte run and
+    hands lane ``t`` elements ``t, t+16, t+32, t+48`` of it, so a run laid out as four K
+    values of sixteen M rows, K-major, gives each lane four consecutive K of one row. A
+    ``k=32`` MFMA wants eight, so this reads the run at ``lds_byte_addr`` for the low four
+    and the run ``run_stride_bytes`` later for the high four, then concatenates.
+    """
+    ptr3 = ir.Type.parse("!llvm.ptr<3>")
+    i16x4 = ir.VectorType.get([4], ir.IntegerType.get_signless(16))
+    i16x8 = ir.VectorType.get([8], ir.IntegerType.get_signless(16))
+    lo = rocdl_ods.ds_read_tr16_b64(i16x4, llvm.inttoptr(ptr3, arith.unwrap(lds_byte_addr)))
+    hi = rocdl_ods.ds_read_tr16_b64(i16x4, llvm.inttoptr(ptr3, arith.unwrap(lds_byte_addr + run_stride_bytes)))
+    return fx.Vector(llvm.bitcast(result_type, llvm.shufflevector(i16x8, lo, hi, [0, 1, 2, 3, 4, 5, 6, 7])))
 
 
 def _evict_weight(key, _ref):
@@ -295,6 +402,7 @@ def compile_conv3d_implicit(
     wgm=1,
     groups=1,
     out_ndhwc=False,
+    nchw_a=False,
 ):
     TILE_M, TILE_N, WAVE_M, WAVE_N = tile
     BLOCK_THREADS = WAVE_M * WAVE_N * WARP_SIZE
@@ -411,6 +519,47 @@ def compile_conv3d_implicit(
         and ho == h
         and wo == w
     )
+
+    # NCDHW A tile: run `r` holds K values 4*(r // A_RUNS_M) .. +3 of M rows
+    # 16*(r % A_RUNS_M) .. +15, K-major, and ds_read_tr16_b64 turns one run into four
+    # lanes' worth of MFMA A. See the notes at NCHW_A_MIN_TILE_M.
+    NCHW_A = bool(nchw_a)
+    if NCHW_A:
+        assert TILE_M % NCHW_A_MIN_TILE_M == 0, f"NCDHW A tile needs TILE_M % {NCHW_A_MIN_TILE_M} == 0"
+        assert TILE_K == MFMA_A_VALUES * (WARP_SIZE // MFMA_M), "NCDHW A tile assumes one K octet per lane group"
+    A_RUNS_M = TILE_M // MFMA_M
+    A_RUN_ELEMS = MFMA_M * (MFMA_A_VALUES // 2)  # 64: 16 M rows x 4 K
+    A_TR_STRIDE_BYTES = A_RUNS_M * A_RUN_ELEMS * BF16_BYTES
+
+    # --- staging the epilogue through LDS, so the NCDHW store is contiguous ---
+    #
+    # An MFMA C fragment hands a lane 4 consecutive npq at one channel, and the 16 lanes of
+    # a group sit at 16 different channels, so one NCDHW store instruction touches 16
+    # disjoint 32-byte segments where the same bytes laid out along npq would take four
+    # cache lines. Bouncing the tile through LDS fixes that at no cost in space -- the A
+    # staging buffer is dead by the epilogue -- by re-landing one MFMA column block's
+    # channels as whole npq runs: every lane then stores 16 bytes and 32 consecutive lanes
+    # cover 512 contiguous bytes of one channel.
+    EPI_VEC = 8  # bf16 per thread per global store: 16B, the widest buffer_store
+    EPI_ROWS = WAVE_N * MFMA_N  # channels staged per round: one MFMA column block per wave
+    # Row pad, in elements. 8 keeps the row stride 16B-aligned for the vec8 read-back and
+    # spreads a wave's b64 writes evenly over all 32 banks; 0 would put every row on bank 0.
+    EPI_PAD = 8
+    EPI_STRIDE = TILE_M + EPI_PAD
+    EPI_TOTAL = EPI_ROWS * TILE_M // EPI_VEC  # vec8 slots to drain per round
+    LDS_EPILOGUE = (
+        not out_ndhwc  # NDHWC output is already contiguous over the GEMM's own index space
+        and not use_splitk  # split-K stores are f32 atomics, not plain stores
+        and not BIG_OUT
+        # dhw % EPI_VEC buys three things at once: a channel's rows start 16B-aligned, a
+        # vec8 span never straddles a batch boundary, and npq % EPI_VEC == 0, so the tail
+        # check stays uniform across a span.
+        and dhw % EPI_VEC == 0
+        and TILE_M % EPI_VEC == 0
+        and EPI_ROWS * EPI_STRIDE <= LDS_A_SIZE
+        and EPI_TOTAL % BLOCK_THREADS == 0
+    )
+    EPI_ITERS = EPI_TOTAL // BLOCK_THREADS if LDS_EPILOGUE else 0
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def conv3d_implicit_kernel(y: fx.Tensor, x: fx.Tensor, weight: fx.Tensor, bias: fx.Tensor):
@@ -569,6 +718,19 @@ def compile_conv3d_implicit(
         _row_dec = []  # per-i tuple of precomputed row terms
         for i in range_constexpr(LDG_A_COUNT):
             linear = (tid + i * BLOCK_THREADS) * LDG_VEC
+            if const_expr(NCHW_A):
+                # Invert the run layout: this thread's LDG_VEC contiguous LDS elements sit
+                # at `pos` inside run `run`, which pins one K and LDG_VEC consecutive rows.
+                run = linear // A_RUN_ELEMS
+                pos = linear % A_RUN_ELEMS
+                local_k = (run // A_RUNS_M) * (MFMA_A_VALUES // 2) + pos // MFMA_M
+                local_m = (run % A_RUNS_M) * MFMA_M + pos % MFMA_M
+                row = m_offset + local_m
+                row_valid = row < fx.Index(npq)
+                # NCDHW element offset of (row, channel 0); the channel adds cc * dhw.
+                row_base = row if const_expr(n == 1) else (row // dhw) * fx.Index(c * dhw) + row % dhw
+                _row_dec.append((local_k, row_base, row_valid))
+                continue
             local_m = linear // TILE_K
             local_k = linear % TILE_K
             row = m_offset + local_m
@@ -596,6 +758,14 @@ def compile_conv3d_implicit(
 
         SCALAR_K = CGP % TILE_K == 0
 
+        def _a_addr_nchw(i, kbase_i):
+            """NCDHW gather: a 1x1 filter's K axis is the input channel, nothing else."""
+            local_k, row_base, row_valid = _row_dec[i]
+            k_abs = kbase_i + fx.Index(local_k)
+            cc = (ch_base + k_abs) if const_expr(groups > 1) else k_abs
+            valid = row_valid & (k_abs < fx.Index(crs))
+            return fx.Int32(row_base + cc * fx.Index(dhw)), valid
+
         # ---- 3D im2col address math ----
         # The K axis decomposes against CGP (per-group channels) while every g_off below
         # keeps `c` (padded total channels) as the NDHWC row stride. `cc` is the absolute
@@ -620,7 +790,10 @@ def compile_conv3d_implicit(
 
                 delta = temporal_delta if const_expr(pad_mode == "zeros") else (in_t - out_t)
                 if const_expr(BIG_IN_N1):
-                    g_off = ((row + delta * hw_o) - (fx.Index(nbase) * dhw + base_t * hw_o)) * c + cc
+                    # base_h rides in x_base_elem whenever _t_aligned, so it has to come
+                    # back out here as well -- kh == kw == 1 keeps the row otherwise flat.
+                    rebased = (row + delta * hw_o) - (fx.Index(nbase) * dhw + base_t * hw_o)
+                    g_off = rebased * c + cc - base_h * fx.Index(w * c)
                 else:
                     g_off = (row + delta * hw_o) * c + cc
             else:
@@ -688,13 +861,19 @@ def compile_conv3d_implicit(
 
         def _load_a(stage, k_base):
             kbase_i = fx.Index(k_base)
+            stage_tile = fx.Index(stage) * TILE_M * TILE_K
+            if const_expr(NCHW_A):
+                for i in range_constexpr(LDG_A_COUNT):
+                    g_off_i, valid = _a_addr_nchw(i, kbase_i)
+                    voff = fx.Int32(arith.select(valid, g_off_i, OOB_ELEM))
+                    _dma_to_lds(x_src, _lds_dma_ptr(a_lds, stage_tile, i), voff)
+                return
             cc_base = ckk_base = None
             if const_expr(SCALAR_K):
                 cc_base = kbase_i % CGP
                 if const_expr(groups > 1):
                     cc_base = ch_base + cc_base
                 ckk_base = kbase_i // CGP
-            stage_tile = fx.Index(stage) * TILE_M * TILE_K
             for i in range_constexpr(LDG_A_COUNT):
                 if const_expr(BIG_IN_NM):
                     addr_ret = _a_addr(i, kbase_i, cc_base, ckk_base)
@@ -718,7 +897,22 @@ def compile_conv3d_implicit(
                 _dma_to_lds(w_src, _lds_dma_ptr(b_lds, stage_tile, i), voff)
 
         # ---- single-vec ds_read (LDS -> register), indexed by per-wave MFMA row ----
+        if const_expr(NCHW_A):
+            # Address of run (lane_k_a // 4, wave_m * MI_M) at this lane, in bytes. The
+            # per-mi run and the second half of the K octet are constant strides off it.
+            a_tr_base = fx.Int32(fx.ptrtoint(a_lds.ptr)) + fx.Int32(
+                (
+                    (lane_k_a // (MFMA_A_VALUES // 2)) * fx.Index(A_RUNS_M * A_RUN_ELEMS)
+                    + wave_m * fx.Index(MI_M * A_RUN_ELEMS)
+                    + lane_m * fx.Index(MFMA_A_VALUES // 2)
+                )
+                * BF16_BYTES
+            )
+
         def read_a_vec(stage, mi):
+            if const_expr(NCHW_A):
+                addr = a_tr_base + fx.Int32((stage * TILE_M * TILE_K + mi * A_RUN_ELEMS) * BF16_BYTES)
+                return _lds_read_transpose_frag(Vec8Ty.ir_type, addr, A_TR_STRIDE_BYTES)
             a_row = wave_m * WARP_M + mi * MFMA_M + lane_m
             return lds_load_vec8(a_lds, a_lds_off(stage, fx.Index(a_row), fx.Index(lane_k_a)))
 
@@ -734,7 +928,8 @@ def compile_conv3d_implicit(
 
         def read_a_frags(stage):
             frags = [read_a_vec(stage, mi) for mi in range_constexpr(MI_M)]
-            rocdl.sched_dsrd(MI_M)
+            # The transposed path spends two ds_read_tr per fragment, not one ds_read_b128.
+            rocdl.sched_dsrd(2 * MI_M if const_expr(NCHW_A) else MI_M)
             return frags
 
         def read_b_frags(stage):
@@ -815,6 +1010,60 @@ def compile_conv3d_implicit(
             col = n_offset + col_off
             return col, ((n_local + col_off) if const_expr(groups > 1) else col)
 
+        def _out_off(row, col):
+            """Element offset of (npq row, out-channel col) in the NCDHW output."""
+            if const_expr(n == 1):
+                return col * dhw + row
+            return (row // dhw) * (k * dhw) + col * dhw + row % dhw
+
+        _epi_ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Shared, MFMA_C_VALUES * BF16_BYTES)
+
+        def store_acc_lds():
+            """Drain the accumulator through the (now dead) A staging buffer, one MFMA
+            column block at a time, so each global store covers one channel's npq run."""
+            # The tile lands where the last K tile's A did, so its DMAs and ds_reads have to
+            # have retired before the first write.
+            barrier(vmcnt=0, lgkmcnt=0)
+            lds_row = fx.Index(wave_n * MFMA_N + c_n)
+            _slots_per_row = TILE_M // EPI_VEC  # vec8 slots covering one staged channel
+
+            for ni in range_constexpr(MI_N):
+                if const_expr(has_bias):
+                    col, col_loc = _cols(ni)
+                    col_i = fx.Int32(col)  # bias is indexed by the global out-channel
+                    if const_expr(n_tail):
+                        col_i = arith.select(col_loc < fx.Index(KG), col_i, fx.Int32(0))
+                    bias_val = fx.Float32(buffer_ops.buffer_load(bias_rsrc, col_i, vec_width=1, dtype=fx.Float32))
+                if const_expr(ni > 0):
+                    # The previous round's readers have to be done before their slots move.
+                    barrier(vmcnt=None, lgkmcnt=0)
+
+                for mi in range_constexpr(MI_M):
+                    a = Vec(acc[mi * MI_N + ni])
+                    vals = []
+                    for i in range_constexpr(MFMA_C_VALUES):
+                        cval = (a[i] + bias_val) if const_expr(has_bias) else a[i]
+                        vals.append(cval.to(elem_ty))
+                    lds_m = fx.Index(wave_m * WARP_M + mi * MFMA_M + c_m_vec)
+                    addr = fx.Int64(fx.ptrtoint(a_lds.ptr)) + fx.Int64(lds_row * EPI_STRIDE + lds_m) * fx.Int64(
+                        BF16_BYTES
+                    )
+                    fx.ptr_store(fx.Vector.from_elements(vals, dtype=elem_ty), fx.inttoptr(_epi_ptr_ty, addr))
+
+                barrier(vmcnt=None, lgkmcnt=0)
+
+                for it in range_constexpr(EPI_ITERS):
+                    idx = tid + it * BLOCK_THREADS
+                    r_row = idx // _slots_per_row  # staged channel slot
+                    r_m = (idx % _slots_per_row) * EPI_VEC  # local npq in the tile
+                    v = lds_load_vec8(a_lds, r_row * EPI_STRIDE + r_m)
+                    # Undo the (wave_n, c_n) packing the writers used to get the channel back.
+                    col_off = (r_row // MFMA_N) * WARP_N + r_row % MFMA_N + ni * MFMA_N
+                    col = n_offset + col_off
+                    col_loc = (n_local + col_off) if const_expr(groups > 1) else col
+                    row = m_offset + r_m
+                    buffer_ops.buffer_store(v, y_rsrc, _route(_out_off(row, col), row, col_loc))
+
         def store_acc():
             if const_expr(has_bias and not use_splitk):
                 bias_vals = []
@@ -888,7 +1137,10 @@ def compile_conv3d_implicit(
                         else:
                             _emit()
 
-        store_acc()
+        if const_expr(LDS_EPILOGUE):
+            store_acc_lds()
+        else:
+            store_acc()
 
     @flyc.jit
     def launch(y: fx.Tensor, x: fx.Tensor, weight: fx.Tensor, bias: fx.Tensor, stream: fx.Stream = fx.Stream(None)):
@@ -910,7 +1162,13 @@ def compile_conv3d_implicit(
 
 SPLITK_MAX_STAGING_BYTES = 0xFFFFFFFF
 
+# K tiles a one-wave grid must have before split-K's two extra launches pay for
+# themselves. See the deep-K branch in _resolve_splitk for the measurement.
+SPLITK_LONG_K_TILES = 256
+SPLITK_MAX_DEEP = 16
 
+
+@functools.lru_cache(maxsize=8)
 def _num_cu(device):
     try:
         return torch.cuda.get_device_properties(device).multi_processor_count
@@ -918,17 +1176,64 @@ def _num_cu(device):
         return 256
 
 
-def _pick_tile(npq, k, groups, device):
+@functools.lru_cache(maxsize=8)
+def _lds_budget(device):
+    """Bytes of LDS one block may allocate: 64KB on CDNA3, 160KB on CDNA4."""
+    try:
+        return torch.cuda.get_device_properties(device).shared_memory_per_block
+    except Exception:
+        return 64 * 1024
+
+
+def _tile_lds_bytes(tile_m, tile_n):
+    """What ``compile_conv3d_implicit`` allocates for this tile's A and B stages."""
+    return 2 * TILES_PER_BARRIER * (tile_m + tile_n) * TILE_K * BF16_BYTES
+
+
+@functools.lru_cache(maxsize=256)
+def _pick_tile(npq, k, crs, x_bytes, groups, device):
+    """(tile, wgm) for this problem: the smallest tile that fills the GPU, widened when
+    the shape is bandwidth-bound.
+
+    The base rule is occupancy: walk down ``TILE_LADDER`` and take the first tile whose
+    grid reaches ``TILE_MIN_WAVES_PER_CU``, so a small problem gets a small tile rather
+    than a few fat blocks on an idle GPU.
+
+    That rule alone is blind to DRAM traffic, and one thing it misses is expensive. When
+    ``TILE_N`` does not cover K/groups the activation is read from HBM once per N tile,
+    and on a shape with little arithmetic to hide it behind, those extra passes are the
+    whole runtime -- a 1x1 conv over 512 channels moves 536MB to do 69 GFLOP. So compare
+    the two limits directly and, when DRAM wins, spend LDS on a tile that spans K in one
+    step. Measured on gfx950 for 1,512,512,512 x 256,512,1,1: 189us at (128, 128, 2, 4),
+    144us at (256, 256, 2, 4). Compute-bound shapes keep the narrow tile, which is what
+    the ridge-point test is there to tell apart -- the 3x3 convs at the same input size
+    sit a factor of two on the arithmetic side of it.
+    """
     kg = k // groups
-    legal = [t for t in TILE_LADDER if t[1] <= kg] or [TILE_LADDER[-1]]
     target = TILE_MIN_WAVES_PER_CU * _num_cu(device)
-    for tile_m, tile_n, wave_m, wave_n in legal:
-        blocks = ((npq + tile_m - 1) // tile_m) * groups * ((kg + tile_n - 1) // tile_n)
-        if blocks * wave_m * wave_n >= target:
-            return (tile_m, tile_n, wave_m, wave_n)
-    return legal[-1]
+
+    def fills_gpu(tile):
+        blocks = ((npq + tile[0] - 1) // tile[0]) * groups * ((kg + tile[1] - 1) // tile[1])
+        return blocks * tile[2] * tile[3] >= target
+
+    legal = [t for t in TILE_LADDER if t[1] <= kg] or [TILE_LADDER[-1]]
+    base = next((t for t in legal if fills_gpu(t)), legal[-1])
+
+    n_tiles = (kg + base[1] - 1) // base[1]
+    if n_tiles == 1:
+        return base, 1
+    dram_bytes = n_tiles * x_bytes + npq * k * BF16_BYTES
+    if dram_bytes * TILE_RIDGE_FLOP_PER_BYTE <= 2 * npq * kg * groups * crs:
+        return base, 1
+
+    budget = _lds_budget(device)
+    for tile in TILE_LADDER_WIDE:
+        if tile[1] >= kg and _tile_lds_bytes(tile[0], tile[1]) <= budget and fills_gpu(tile):
+            return tile, 1
+    return base, TILE_WIDE_WGM
 
 
+@functools.lru_cache(maxsize=256)
 def _resolve_splitk(splitk, npq, crs, k, device, tile=DEFAULT_TILE, groups=1):
     k_tiles = (crs + TILE_K - 1) // TILE_K
     if npq * k * 4 > SPLITK_MAX_STAGING_BYTES:
@@ -937,21 +1242,24 @@ def _resolve_splitk(splitk, npq, crs, k, device, tile=DEFAULT_TILE, groups=1):
         tile_m, tile_n = tile[0], tile[1]
         kg = k // groups
         base = ((npq + tile_m - 1) // tile_m) * groups * ((kg + tile_n - 1) // tile_n)
-        if (
-            npq < 4096
-            or k_tiles < 16
-            or kg % tile_n != 0
-            or npq % tile_m != 0
-            or crs % TILE_K != 0
-            or npq * k * 4 > 0x7FFFFFFF
-        ):
+        num_cu = _num_cu(device)
+        if crs % TILE_K != 0 or npq * k * 4 > 0x7FFFFFFF:
+            sk = 1
+        elif base < num_cu and k_tiles >= SPLITK_LONG_K_TILES:
+            # Deep-K, few-block shapes -- small spatial extent over many channels -- never
+            # fill the grid, so every block runs in one wave and the kernel costs one
+            # block's entire K loop while the rest of the GPU waits. Split-K buys that
+            # back for two extra launches (the fp32 staging memset and the epilogue that
+            # narrows it), a fixed cost only a long K loop repays: measured on gfx950,
+            # k_tiles=288 takes a 59us conv to 44us, while k_tiles=144 takes a 32us one
+            # to 44us. Neither a small npq nor a ragged tile gates this the way it gates
+            # the general case below -- the epilogue already masks both tails, and a grid
+            # this empty has no occupancy left to lose to them.
+            sk = min(SPLITK_MAX_DEEP, max(1, 4 * num_cu // base), k_tiles // 16)
+        elif npq < 4096 or k_tiles < 16 or kg % tile_n != 0 or npq % tile_m != 0 or base >= (3 * num_cu) // 4:
             sk = 1
         else:
-            num_cu = _num_cu(device)
-            if base >= (3 * num_cu) // 4:
-                sk = 1
-            else:
-                sk = min(4, max(1, num_cu // base), k_tiles)
+            sk = min(4, max(1, num_cu // base), k_tiles)
     else:
         sk = max(1, splitk)
     while sk > 1 and k_tiles % sk != 0:
@@ -1001,6 +1309,7 @@ def _conv3d_impl(
     autotune=None,
     input_layout="NCDHW",
     output_layout="NCDHW",
+    matmul_1x1=True,
 ):
     _check_layouts(3, input_layout, output_layout)
 
@@ -1055,7 +1364,8 @@ def _conv3d_impl(
     pad_mode = padding_mode if inline_pad else "zeros"
 
     if (
-        groups == 1
+        matmul_1x1
+        and groups == 1
         and kt == 1
         and kh == 1
         and kw == 1
@@ -1104,9 +1414,27 @@ def _conv3d_impl(
 
     launch_stream = torch.cuda.current_stream() if stream is None else stream
     has_bias = bias is not None
-    bias_arg = bias.to(torch.float32).contiguous() if has_bias else torch.empty(1, device=x.device, dtype=torch.float32)
+    bias_arg = bias.to(torch.float32).contiguous() if has_bias else _bias_placeholder(x.device)
 
-    x_ndhwc = x.contiguous() if in_ndhwc else _ncdhw_to_ndhwc(x, stream)
+    # Whether the input is transposed depends on the tile, so the tile is settled first.
+    # Autotune is the exception: its sweep spans tiles the NCDHW A layout cannot serve, so
+    # it stays on the transposed input and picks among tiles on equal terms.
+    nchw_a = _nchw_a_ok(in_ndhwc, n, c, d, h, w, kt, kh, kw, st, sh, sw, pt, ph, pw, pad_mode)
+    tuning = tile is None and (autotune or (autotune is None and _autotune_enabled()))
+    if tile is not None:
+        chosen_tile, chosen_wgm = tuple(tile), 1
+    elif tuning:
+        chosen_tile, chosen_wgm = None, 1
+    else:
+        chosen_tile, chosen_wgm = _pick_tile(npq, k, crs, n * c * d * h * w * BF16_BYTES, groups, x.device)
+    nchw_a = nchw_a and not tuning and chosen_tile[0] % NCHW_A_MIN_TILE_M == 0
+
+    # Hand the transpose the stream we already resolved; letting it default would cost a
+    # second torch.cuda.current_stream(), which is ~2.7us of the small-shape host budget.
+    if nchw_a:
+        x_arg = x.contiguous()
+    else:
+        x_arg = x.contiguous() if in_ndhwc else _ncdhw_to_ndhwc(x, launch_stream)
     w_packed = _prep_weight(weight, k, kt, kh, kw, wc)
 
     shape = (n, c, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, dt, dh, dw, pad_mode, has_bias, groups, out_ndhwc)
@@ -1144,22 +1472,17 @@ def _conv3d_impl(
             the_wgm,
             groups,
             out_ndhwc,
+            nchw_a,
         )
-        _dispatch(exe, y, x_ndhwc, w_packed, bias_arg, stream=launch_stream)
+        _dispatch(exe, y, x_arg, w_packed, bias_arg, stream=launch_stream)
         return y, sk
 
-    if tile is not None:
-        chosen_tile = tuple(tile)
-        chosen_wgm = 1
-    elif autotune or (autotune is None and _autotune_enabled()):
+    if tuning:
         from kernels.conv.conv3d_autotune import BF16_CANDIDATES, WGM_VALUES, autotune_conv3d
 
         candidates = [(t, w) for t in BF16_CANDIDATES for w in WGM_VALUES]
         best = autotune_conv3d("bf16", shape, "bf16", candidates, x.device, lambda tw: _run(tw[0], tw[1])[0])
         chosen_tile, chosen_wgm = best
-    else:
-        chosen_tile = _pick_tile(npq, k, groups, x.device)
-        chosen_wgm = 1
 
     y, sk = _run(chosen_tile, chosen_wgm)
     if sk > 1:
@@ -1287,6 +1610,12 @@ def conv3d_implicit(x, weight, bias=None, stride=1, padding=0, dilation=1, **kwa
     the K axis, while K/groups=1 leaves all but one column of the N tile masked.
     Narrower tiles recover little there -- depthwise wants its own kernel, not this
     single-GEMM mapping.
+
+    An unstrided unpadded 1x1 filter is a pure channel GEMM (im2col degenerates to a
+    reshape), so it goes to ``torch.matmul`` by default. ``matmul_1x1=False`` forces those
+    shapes through the kernel instead -- for benchmarking the kernel itself, or to avoid
+    rocBLAS's 32-bit output indexing on an output above 2**32 elements. Grouped 1x1 is
+    block-diagonal rather than a plain channel GEMM and always goes through the kernel.
     """
     spatial_rank = weight.dim() - 2
     if spatial_rank not in (1, 2, 3):
