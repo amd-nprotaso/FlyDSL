@@ -262,12 +262,25 @@ TR_MAX_BIG_S = (0x7FFFFFFF - (TR_TILE - TR_VEC)) // (TR_TILE - 1)
 
 
 @functools.lru_cache(maxsize=64)
-def compile_transpose_ncdhw_ndhwc(n, c, s):
-    """Transpose flat (N, C, S) -> (N, S, C) (S == T*H*W). Requires c%8==0."""
+def compile_transpose_ncdhw_ndhwc(n, c, s, cp=None, groups=1):
+    """Transpose flat (N, C, S) -> (N, S, Cp) (S == T*H*W), widening C to Cp with zeros.
+
+    ``cp`` is the channel count the GEMM indexes, ``_pad_channels(c // groups) * groups``.
+    Writing each group's zero tail here rather than with a separate ``F.pad`` is what
+    keeps an unaligned-C input to one launch instead of a fill, a copy and this. Requires
+    ``cp % 8 == 0``, which ``_pad_channels`` guarantees; ``cp == c`` is the plain
+    transpose and compiles to what it always did.
+    """
+    cp = c if cp is None else cp
+    cg, cgp = c // groups, cp // groups
+    PADDED = cp != c
+    # Only a spread-out group needs the source channel derived rather than copied, and
+    # only then can a tile start past the end of the input -- see the read loop.
+    REMAP = PADDED and groups > 1
     grid_s = (s + TR_TILE - 1) // TR_TILE
-    grid_c = (c + TR_TILE - 1) // TR_TILE
+    grid_c = (cp + TR_TILE - 1) // TR_TILE
     elem_ty = fx.BFloat16
-    BIG = (n * c * s) > 0x7FFFFFFF
+    BIG = (n * cp * s) > 0x7FFFFFFF
 
     @flyc.kernel(known_block_size=[TR_THREADS, 1, 1])
     def transpose_kernel(out: fx.Tensor, inp: fx.Tensor):
@@ -288,12 +301,12 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
             in_base_elem = fx.Index(nb) * fx.Index(c) * fx.Index(s) + fx.Index(c0) * fx.Index(s) + fx.Index(s0)
             in_addr = fx.Int64(buffer_ops.extract_base_index(inp)) + fx.Int64(in_base_elem) * fx.Int64(2)
             in_rsrc = buffer_ops.create_buffer_resource_from_addr(in_addr)
-            out_base_elem = fx.Index(nb) * fx.Index(s) * fx.Index(c) + fx.Index(s0) * fx.Index(c) + fx.Index(c0)
+            out_base_elem = fx.Index(nb) * fx.Index(s) * fx.Index(cp) + fx.Index(s0) * fx.Index(cp) + fx.Index(c0)
             out_addr = fx.Int64(buffer_ops.extract_base_index(out)) + fx.Int64(out_base_elem) * fx.Int64(2)
             out_rsrc = buffer_ops.create_buffer_resource_from_addr(out_addr)
         else:
             in_base = nb * c * s
-            out_base = nb * s * c
+            out_base = nb * s * cp
 
         _lds_st_ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Shared, TR_VEC * BF16_BYTES)
 
@@ -305,20 +318,34 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
             u8 = fx.recast_iter(fx.Uint8, lds.ptr)
             return fx.ptr_load(u8 + fx.Int32(elem_offset * 2), result_type=BF16Ty)
 
-        # Read: coalesced vec8 along contiguous S -> LDS[c_local][s_local].
+        # Read: coalesced vec8 along contiguous S -> LDS[c_local][s_local]. `cc` is the
+        # DESTINATION channel, so a widened group maps it back to the channel it came
+        # from and hands LDS zeros for the tail -- the F.pad this kernel absorbs.
         for i in range_constexpr(_TR_ITERS):
             lin = tid + i * TR_THREADS
             rc = lin // _TR_VPL
             sv = (lin % _TR_VPL) * TR_VEC
             cc = c0 + rc
             ss = s0 + sv
-            valid = (cc < c) & (ss < s)
+            if const_expr(REMAP):
+                ci = cc % cgp
+                src_c = (cc // cgp) * cg + ci
+                in_chan = (ci < cg) & (cc < cp)
+            else:
+                src_c = cc
+                in_chan = cc < c
+            valid = in_chan & (ss < s)
             if const_expr(BIG):
+                # The rebase leans on src_c == cc, which REMAP breaks; a widened group
+                # therefore never reaches the BIG path (see `_ncdhw_to_ndhwc`). It also
+                # means c0 < c holds, so the rebased origin stays inside the input.
                 g = fx.Int32(rc * s + sv)
             else:
-                g = fx.Int32(in_base + cc * s + ss)
+                g = fx.Int32(in_base + src_c * s + ss)
             safe = arith.select(valid, g, fx.Int32(0))
             v = buffer_ops.buffer_load(in_rsrc, safe, vec_width=TR_VEC, dtype=elem_ty)
+            if const_expr(PADDED):
+                v = fx.Vector(arith.select(in_chan, v, fx.Vector.zeros_like(v)), dtype=elem_ty)
             lds_store_vec8(rc * _TR_LDS_S + sv, v)
 
         rocdl.s_waitcnt(lgkmcnt=0)
@@ -332,12 +359,12 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
             cc = c0 + cv
             scalars = [lds_load_scalar((cv + j) * _TR_LDS_S + rs) for j in range_constexpr(TR_VEC)]
             vv = fx.Vector.from_elements(scalars, dtype=elem_ty)
-            valid = (ss < s) & (cc < c)
+            valid = (ss < s) & (cc < cp)
             if valid:
                 if const_expr(BIG):
-                    go = fx.Int32(rs * c + cv)
+                    go = fx.Int32(rs * cp + cv)
                 else:
-                    go = fx.Int32(out_base + ss * c + cc)
+                    go = fx.Int32(out_base + ss * cp + cc)
                 buffer_ops.buffer_store(vv, out_rsrc, go)
 
     @flyc.jit
@@ -360,19 +387,43 @@ def compile_transpose_ncdhw_ndhwc(n, c, s):
     return _launch
 
 
-def _ncdhw_to_ndhwc(x, stream):
-    """Fast NCDHW->NDHWC via the tiled transpose kernel; falls back to torch."""
+def _pad_channels_ncdhw(x, cp, groups):
+    """Widen each group's channel block to ``cp // groups`` with zeros, in NCDHW."""
+    n, c, d, h, w = x.shape
+    cg, cgp = c // groups, cp // groups
+    x = torch.nn.functional.pad(x.reshape(n, groups, cg, d, h, w), (0, 0, 0, 0, 0, 0, 0, cgp - cg))
+    return x.reshape(n, cp, d, h, w)
+
+
+def _ncdhw_to_ndhwc(x, stream, cp=None, groups=1):
+    """Fast NCDHW->NDHWC via the tiled transpose kernel; falls back to torch.
+
+    ``cp`` asks for each group's channels to be widened to ``cp // groups`` on the way
+    out. Folding that into the transpose is what keeps an unaligned-C input to a single
+    launch; only the paths that cannot fuse it fall back to a separate ``F.pad``.
+    """
     n, c, t, h, w = x.shape
+    cp = c if cp is None else cp
     s = t * h * w
-    big = n * c * s > 0x7FFFFFFF
-    if not (x.is_contiguous() and x.dtype == torch.bfloat16 and c % TR_VEC == 0):
-        return x.permute(0, 2, 3, 4, 1).contiguous()
-    if big and s > TR_MAX_BIG_S:
-        return x.permute(0, 2, 3, 4, 1).contiguous()
-    out = torch.empty((n, t, h, w, c), device=x.device, dtype=x.dtype)
-    exe = compile_transpose_ncdhw_ndhwc(n, c, s)
-    _dispatch(exe, out, x, stream=torch.cuda.current_stream() if stream is None else stream)
-    return out
+    big = n * cp * s > 0x7FFFFFFF
+    if (
+        x.is_contiguous()
+        and x.dtype == torch.bfloat16
+        and cp % TR_VEC == 0
+        # A rebased tile addresses its source by its own channel row, which tracks the
+        # destination row only while the groups are not being spread apart.
+        and (cp == c or groups == 1 or not big)
+        and not (big and max(s, cp) > TR_MAX_BIG_S)
+    ):
+        out = torch.empty((n, t, h, w, cp), device=x.device, dtype=x.dtype)
+        exe = compile_transpose_ncdhw_ndhwc(n, c, s, cp, groups)
+        _dispatch(exe, out, x, stream=torch.cuda.current_stream() if stream is None else stream)
+        return out
+    if cp != c:
+        # Widening it separately is the slow way round, but the transpose itself may
+        # still be the kernel's to do.
+        return _ncdhw_to_ndhwc(_pad_channels_ncdhw(x, cp, groups), stream)
+    return x.permute(0, 2, 3, 4, 1).contiguous()
 
 
 @functools.lru_cache(maxsize=256)
@@ -1400,16 +1451,12 @@ def _conv3d_impl(
         empty = (0, do, ho, wo, k) if out_ndhwc else (0, k, do, ho, wo)
         return torch.empty(empty, device=x.device, dtype=torch.bfloat16)
 
+    # `c` becomes the channel count the GEMM indexes; `c_src` is what `x` still holds.
+    # The widening is not applied here -- the NCDHW route folds it into the transpose it
+    # already runs, which is one launch instead of F.pad's fill and copy plus that.
     cg = c // groups
     cgp = _pad_channels(cg)
-    if cgp != cg:
-        if in_ndhwc:
-            x = torch.nn.functional.pad(x.reshape(n, d, h, w, groups, cg), (0, cgp - cg))
-            x = x.reshape(n, d, h, w, groups * cgp)
-        else:
-            x = torch.nn.functional.pad(x.reshape(n, groups, cg, d, h, w), (0, 0, 0, 0, 0, 0, 0, cgp - cg))
-            x = x.reshape(n, groups * cgp, d, h, w)
-    c = groups * cgp
+    c_src, c = c, groups * cgp
     crs = cgp * kt * kh * kw
 
     launch_stream = torch.cuda.current_stream() if stream is None else stream
@@ -1419,7 +1466,9 @@ def _conv3d_impl(
     # Whether the input is transposed depends on the tile, so the tile is settled first.
     # Autotune is the exception: its sweep spans tiles the NCDHW A layout cannot serve, so
     # it stays on the transposed input and picks among tiles on equal terms.
-    nchw_a = _nchw_a_ok(in_ndhwc, n, c, d, h, w, kt, kh, kw, st, sh, sw, pt, ph, pw, pad_mode)
+    # Reading NCDHW in place has no step to widen the channels in, and paying F.pad to
+    # get them is no cheaper than the transpose it exists to avoid, so it stays off there.
+    nchw_a = c == c_src and _nchw_a_ok(in_ndhwc, n, c, d, h, w, kt, kh, kw, st, sh, sw, pt, ph, pw, pad_mode)
     tuning = tile is None and (autotune or (autotune is None and _autotune_enabled()))
     if tile is not None:
         chosen_tile, chosen_wgm = tuple(tile), 1
@@ -1433,8 +1482,14 @@ def _conv3d_impl(
     # second torch.cuda.current_stream(), which is ~2.7us of the small-shape host budget.
     if nchw_a:
         x_arg = x.contiguous()
+    elif in_ndhwc:
+        # Already channels-last, so there is no transpose to fold the widening into.
+        if c != c_src:
+            x = torch.nn.functional.pad(x.reshape(n, d, h, w, groups, cg), (0, cgp - cg))
+            x = x.reshape(n, d, h, w, c)
+        x_arg = x.contiguous()
     else:
-        x_arg = x.contiguous() if in_ndhwc else _ncdhw_to_ndhwc(x, launch_stream)
+        x_arg = _ncdhw_to_ndhwc(x, launch_stream, c, groups)
     w_packed = _prep_weight(weight, k, kt, kh, kw, wc)
 
     shape = (n, c, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, dt, dh, dw, pad_mode, has_bias, groups, out_ndhwc)
