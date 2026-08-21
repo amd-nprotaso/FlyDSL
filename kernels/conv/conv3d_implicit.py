@@ -143,10 +143,13 @@ def _shape_ncdhw(x, ndhwc):
     return n, c, d, h, w
 
 
-def _pad_spatial(x, ndhwc, pads, mode="constant"):
-    """Pad (D, H, W) with torch's (w_lo, w_hi, h_lo, h_hi, d_lo, d_hi) ordering."""
-    if mode == "constant":
-        return torch.nn.functional.pad(x, ((0, 0) + pads) if ndhwc else pads), ndhwc
+def _pad_spatial(x, ndhwc, pads, mode):
+    """Materialize (D, H, W) padding, torch's (w_lo, w_hi, h_lo, h_hi, d_lo, d_hi) order.
+
+    Only the non-zero padding modes reach this. Zero padding is entirely a matter of the
+    gather's range mask and the output extent, so it never needs a padded copy of the
+    activation, however lopsided the pad is.
+    """
     if ndhwc:
         x = x.permute(0, 4, 1, 2, 3)
     return torch.nn.functional.pad(x, pads, mode=mode), False
@@ -454,6 +457,7 @@ def compile_conv3d_implicit(
     groups=1,
     out_ndhwc=False,
     nchw_a=False,
+    pad_hi=None,
 ):
     TILE_M, TILE_N, WAVE_M, WAVE_N = tile
     BLOCK_THREADS = WAVE_M * WAVE_N * WARP_SIZE
@@ -484,10 +488,17 @@ def compile_conv3d_implicit(
     assert CGP % LDG_VEC == 0, f"c/groups={CGP} must be a multiple of LDG_VEC={LDG_VEC}; use _conv3d_impl to pad"
     assert BLOCK_THREADS <= 1024, f"BLOCK_THREADS={BLOCK_THREADS} exceeds 1024"
 
+    # `pt/ph/pw` are the LOW pads and are the only ones the gather needs: it derives the
+    # input coordinate as `out * stride - pad_lo` and then either range-masks it (zeros) or
+    # folds it back into [0, ext) (every other mode). The high pad shows up here and
+    # nowhere else, which is why an asymmetric pad costs a different `do` rather than a
+    # padded copy of the activation.
+    qt, qh, qw = (pt, ph, pw) if pad_hi is None else pad_hi
+
     # Dilation only stretches the filter's footprint; the K axis (CRS) is unchanged.
-    do = (d + 2 * pt - (dt * (kt - 1) + 1)) // st + 1
-    ho = (h + 2 * ph - (dh * (kh - 1) + 1)) // sh + 1
-    wo = (w + 2 * pw - (dw * (kw - 1) + 1)) // sw + 1
+    do = (d + pt + qt - (dt * (kt - 1) + 1)) // st + 1
+    ho = (h + ph + qh - (dh * (kh - 1) + 1)) // sh + 1
+    wo = (w + pw + qw - (dw * (kw - 1) + 1)) // sw + 1
     dhw = do * ho * wo
     hw_o = ho * wo
     npq = n * dhw
@@ -1398,19 +1409,16 @@ def _conv3d_impl(
             else:
                 assert p <= ext, f"circular padding {p} must be <= input extent {ext} on spatial axis {ax}"
 
-    if pad_lo != pad_hi:
-        if padding_mode == "zeros":
-            x, in_ndhwc = _pad_spatial(x, in_ndhwc, (0, pad_hi[2] - pw, 0, pad_hi[1] - ph, 0, pad_hi[0] - pt))
-        else:
-            x, in_ndhwc = _pad_spatial(x, in_ndhwc, (pw, pad_hi[2], ph, pad_hi[1], pt, pad_hi[0]), mode=padding_mode)
-            pt = ph = pw = 0
+    # An asymmetric pad (only 'same' produces one, when the dilated filter extent is even)
+    # is handled by the kernel like any other: the gather reads the low pad alone, and the
+    # high pad reaches it as part of the output extent. Nothing is materialized here.
+    inline_pad = padding_mode != "zeros" and (any(pad_lo) or any(pad_hi))
+    if inline_pad and _big_in(n, c, groups, d, h, w, *map(max, pad_lo, pad_hi)):
+        pads = (pad_lo[2], pad_hi[2], pad_lo[1], pad_hi[1], pad_lo[0], pad_hi[0])
+        x, in_ndhwc = _pad_spatial(x, in_ndhwc, pads, padding_mode)
         n, c, d, h, w = _shape_ncdhw(x, in_ndhwc)
-
-    inline_pad = padding_mode != "zeros" and bool(pt or ph or pw)
-    if inline_pad and _big_in(n, c, groups, d, h, w, pt, ph, pw):
-        x, in_ndhwc = _pad_spatial(x, in_ndhwc, (pw, pw, ph, ph, pt, pt), mode=padding_mode)
-        n, c, d, h, w = _shape_ncdhw(x, in_ndhwc)
-        pt = ph = pw = 0
+        pad_lo = pad_hi = (0, 0, 0)
+        pt, ph, pw = pad_lo
         inline_pad = False
     pad_mode = padding_mode if inline_pad else "zeros"
 
@@ -1441,9 +1449,9 @@ def _conv3d_impl(
             y = y + bias.to(y.dtype).view(1, k, 1, 1, 1)
         return y.permute(0, 2, 3, 4, 1).contiguous() if out_ndhwc else y
 
-    do = (d + 2 * pt - (dt * (kt - 1) + 1)) // st + 1
-    ho = (h + 2 * ph - (dh * (kh - 1) + 1)) // sh + 1
-    wo = (w + 2 * pw - (dw * (kw - 1) + 1)) // sw + 1
+    do = (d + pad_lo[0] + pad_hi[0] - (dt * (kt - 1) + 1)) // st + 1
+    ho = (h + pad_lo[1] + pad_hi[1] - (dh * (kh - 1) + 1)) // sh + 1
+    wo = (w + pad_lo[2] + pad_hi[2] - (dw * (kw - 1) + 1)) // sw + 1
     assert min(do, ho, wo) >= 1, f"dilated filter is larger than the padded input: output ({do}, {ho}, {wo})"
     npq = n * do * ho * wo
 
@@ -1492,7 +1500,12 @@ def _conv3d_impl(
         x_arg = _ncdhw_to_ndhwc(x, launch_stream, c, groups)
     w_packed = _prep_weight(weight, k, kt, kh, kw, wc)
 
-    shape = (n, c, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, dt, dh, dw, pad_mode, has_bias, groups, out_ndhwc)
+    shape = (
+        # fmt: off
+        n, c, d, h, w, k, kt, kh, kw, st, sh, sw, pt, ph, pw, pad_hi,
+        dt, dh, dw, pad_mode, has_bias, groups, out_ndhwc,
+        # fmt: on
+    )
 
     def _run(the_tile, the_wgm=1):
         sk = _resolve_splitk(splitk, npq, crs, k, x.device, the_tile, groups)
@@ -1528,6 +1541,7 @@ def _conv3d_impl(
             groups,
             out_ndhwc,
             nchw_a,
+            pad_hi,
         )
         _dispatch(exe, y, x_arg, w_packed, bias_arg, stream=launch_stream)
         return y, sk
@@ -1643,11 +1657,11 @@ def conv3d_implicit(x, weight, bias=None, stride=1, padding=0, dilation=1, **kwa
     ``padding`` takes an int, a per-axis tuple, or one of torch's two strings. "valid" is
     no padding. "same" pads so the output keeps the input's spatial extent, which needs
     ``dilation * (kernel - 1)`` elements per axis and, like torch, is only defined at
-    stride 1. That total is normally even and costs nothing beyond an ordinary symmetric
-    pad. An even-length filter under odd dilation makes it odd, and torch's rule of
-    putting the extra element on the high side then asks for a pad the kernel cannot
-    express with one value per axis; that case materializes a padded input first, exactly
-    as torch does (it warns about the same copy). ``padding_mode`` applies to "same" too.
+    stride 1. That total is normally even and splits evenly; an even-length filter under
+    odd dilation makes it odd, and torch's rule puts the extra element on the high side.
+    Either way it costs nothing at runtime: the gather only ever reads the low pad, so the
+    high one is just a wider output extent -- unlike torch, which materializes a padded
+    copy of the input and warns about it. ``padding_mode`` applies to "same" too.
 
     ``dilation`` follows torch semantics: it spaces the filter taps by that factor
     over the input, shrinking the output to
