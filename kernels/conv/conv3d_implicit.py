@@ -67,6 +67,16 @@ TILE_LADDER_WIDE = ((256, 256, 2, 4), (128, 256, 2, 4), (256, 128, 2, 4))
 # of what the wide tile would have (measured 189us -> 159us where the tile gives 144us).
 TILE_WIDE_WGM = 8
 
+# CDNA3/4 hand workgroups to the XCDs round-robin over the flattened dispatch id, so
+# consecutive blocks land on different L2s and the row grouping above never actually shares
+# one. Reindexing so each XCD receives a contiguous run restores that. Only worth doing once
+# the grid wraps the XCDs many times over -- below that the remap just reorders a grid that
+# already fits in one pass -- and only when the block count divides evenly, since a partial
+# last round would map two blocks onto the same id. Measured on gfx950 over eight 3x3
+# shapes at the (128, 128, 2, 4) tile: 1.00x to 1.07x, geomean 1.038x.
+NUM_XCDS = 8
+XCD_SWIZZLE_MIN_BLOCKS = 4 * 304
+
 TILE_MIN_WAVES_PER_CU = 6
 
 # Machine flop:byte ratio above which the MFMAs, not DRAM, set the kernel's time. The true
@@ -141,18 +151,6 @@ def _shape_ncdhw(x, ndhwc):
     else:
         n, c, d, h, w = x.shape
     return n, c, d, h, w
-
-
-def _pad_spatial(x, ndhwc, pads, mode):
-    """Materialize (D, H, W) padding, torch's (w_lo, w_hi, h_lo, h_hi, d_lo, d_hi) order.
-
-    Only the non-zero padding modes reach this. Zero padding is entirely a matter of the
-    gather's range mask and the output extent, so it never needs a padded copy of the
-    activation, however lopsided the pad is.
-    """
-    if ndhwc:
-        x = x.permute(0, 4, 1, 2, 3)
-    return torch.nn.functional.pad(x, pads, mode=mode), False
 
 
 def _big_in(n, c, groups, d, h, w, pt, ph, pw):
@@ -231,28 +229,6 @@ def _lds_read_transpose_frag(result_type, lds_byte_addr, run_stride_bytes):
     return fx.Vector(llvm.bitcast(result_type, llvm.shufflevector(i16x8, lo, hi, [0, 1, 2, 3, 4, 5, 6, 7])))
 
 
-def _evict_weight(key, _ref):
-    """weakref callback: drop the entry the dead weight was pinning."""
-    ent = _WEIGHT_CACHE.get(key)
-    if ent is not None and ent[0]() is None:
-        del _WEIGHT_CACHE[key]
-
-
-def _prep_weight(w, k, kt, kh, kw, c):
-    """Pack (K, C, T, R, S) -> (K, T*R*S*Cpad), memoized on the source weight."""
-    anchor = w._base if w._base is not None else w
-    key = w.data_ptr()
-    stamp = (w._version, tuple(w.shape), w.stride(), w.dtype)
-    ent = _WEIGHT_CACHE.get(key)
-    if ent is not None and ent[0]() is anchor and ent[2] == stamp:
-        return ent[1]
-    cp = _pad_channels(c)
-    wsrc = torch.nn.functional.pad(w, (0, 0, 0, 0, 0, 0, 0, cp - c)) if cp != c else w
-    wk = wsrc.permute(0, 2, 3, 4, 1).contiguous().reshape(k, kt * kh * kw * cp)
-    _WEIGHT_CACHE[key] = (weakref.ref(anchor, functools.partial(_evict_weight, key)), wk, stamp)
-    return wk
-
-
 TR_TILE = 64
 TR_VEC = 8
 TR_THREADS = 256
@@ -269,7 +245,7 @@ def compile_transpose_ncdhw_ndhwc(n, c, s, cp=None, groups=1):
     """Transpose flat (N, C, S) -> (N, S, Cp) (S == T*H*W), widening C to Cp with zeros.
 
     ``cp`` is the channel count the GEMM indexes, ``_pad_channels(c // groups) * groups``.
-    Writing each group's zero tail here rather than with a separate ``F.pad`` is what
+    Writing each group's zero tail here rather than in a separate widening pass is what
     keeps an unaligned-C input to one launch instead of a fill, a copy and this. Requires
     ``cp % 8 == 0``, which ``_pad_channels`` guarantees; ``cp == c`` is the plain
     transpose and compiles to what it always did.
@@ -323,7 +299,7 @@ def compile_transpose_ncdhw_ndhwc(n, c, s, cp=None, groups=1):
 
         # Read: coalesced vec8 along contiguous S -> LDS[c_local][s_local]. `cc` is the
         # DESTINATION channel, so a widened group maps it back to the channel it came
-        # from and hands LDS zeros for the tail -- the F.pad this kernel absorbs.
+        # from and hands LDS zeros for the tail -- the widening this kernel absorbs.
         for i in range_constexpr(_TR_ITERS):
             lin = tid + i * TR_THREADS
             rc = lin // _TR_VPL
@@ -390,12 +366,358 @@ def compile_transpose_ncdhw_ndhwc(n, c, s, cp=None, groups=1):
     return _launch
 
 
-def _pad_channels_ncdhw(x, cp, groups):
-    """Widen each group's channel block to ``cp // groups`` with zeros, in NCDHW."""
-    n, c, d, h, w = x.shape
+WPACK_THREADS = 256
+
+
+@functools.lru_cache(maxsize=64)
+def compile_pack_weight(k, c, s, cp):
+    """Pack flat (K, C, S) -> (K, S, Cp) (S == T*R*S), widening C to Cp with zeros.
+
+    This is the transpose above with K in the batch position, but a filter's S is a
+    handful of taps where an activation's is a whole image, so a 64x64 tile would be
+    almost entirely mask. One thread per destination channel needs no LDS staging
+    instead: it walks the taps, which reads its own source channel's S elements
+    contiguously and leaves neighbouring threads writing neighbouring destinations.
+
+    A block owns one out-channel's slab, so its offsets stay 32-bit however large K is
+    and the descriptors can be sized exactly -- and being exact matters here, because a
+    filter's S is rarely a multiple of the vector width that would keep a tiled read
+    from running off the end of the tensor.
+    """
+    elem_ty = fx.BFloat16
+    PADDED = cp != c
+    grid_c = (cp + WPACK_THREADS - 1) // WPACK_THREADS
+
+    @flyc.kernel(known_block_size=[WPACK_THREADS, 1, 1])
+    def pack_kernel(out: fx.Tensor, inp: fx.Tensor):
+        cc = fx.block_idx.x * WPACK_THREADS + fx.thread_idx.x
+        kk = fx.Index(fx.block_idx.y)
+        in_addr = fx.Int64(buffer_ops.extract_base_index(inp)) + fx.Int64(kk * fx.Index(c * s)) * fx.Int64(BF16_BYTES)
+        out_addr = fx.Int64(buffer_ops.extract_base_index(out)) + fx.Int64(kk * fx.Index(s * cp)) * fx.Int64(BF16_BYTES)
+        in_rsrc = buffer_ops.create_buffer_resource_from_addr(in_addr, num_records_bytes=c * s * BF16_BYTES)
+        out_rsrc = buffer_ops.create_buffer_resource_from_addr(out_addr, num_records_bytes=s * cp * BF16_BYTES)
+
+        if cc < cp:
+            # A tail channel reads channel 0 and throws the result away, which keeps the
+            # load unconditional and inside the input.
+            in_chan = cc < c
+            safe_c = arith.select(in_chan, cc, fx.Int32(0)) if const_expr(PADDED) else cc
+            for j in range_constexpr(s):
+                v = buffer_ops.buffer_load(in_rsrc, safe_c * s + j, vec_width=1, dtype=elem_ty)
+                if const_expr(PADDED):
+                    v = arith.select(in_chan, v, 0.0)
+                buffer_ops.buffer_store(v, out_rsrc, cc + j * cp)
+
+    @flyc.jit
+    def launch_pack(out: fx.Tensor, inp: fx.Tensor, stream: fx.Stream = fx.Stream(None)):
+        pack_kernel(out, inp).launch(
+            grid=(grid_c, k, 1),
+            block=(WPACK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    def _launch(out, inp, stream=None):
+        with CompilationContext.compile_hints(CONV_COMPILE_HINTS):
+            return launch_pack(out, inp, stream=_as_stream(stream))
+
+    def _compile(out, inp, stream=None):
+        with CompilationContext.compile_hints(CONV_COMPILE_HINTS):
+            return flyc.compile(launch_pack, out, inp, _as_stream(stream))
+
+    _launch.compile = _compile
+    return _launch
+
+
+def _evict_weight(key, _ref):
+    """weakref callback: drop the entry the dead weight was pinning."""
+    ent = _WEIGHT_CACHE.get(key)
+    if ent is not None and ent[0]() is None:
+        del _WEIGHT_CACHE[key]
+
+
+def _prep_weight(w, k, kt, kh, kw, c, stream=None):
+    """Pack (K, C, T, R, S) -> (K, T*R*S*Cpad), memoized on the source weight.
+
+    The channel widening the GEMM needs is written on the way out rather than filled
+    into a padded copy first, so this is one launch per weight where it used to be two.
+    """
+    assert w.dtype == torch.bfloat16, f"_prep_weight is bf16-only; got {w.dtype}"
+    anchor = w._base if w._base is not None else w
+    key = w.data_ptr()
+    stamp = (w._version, tuple(w.shape), w.stride(), w.dtype)
+    ent = _WEIGHT_CACHE.get(key)
+    if ent is not None and ent[0]() is anchor and ent[2] == stamp:
+        return ent[1]
+    cp, s = _pad_channels(c), kt * kh * kw
+    src = w if w.is_contiguous() else w.contiguous()
+    wk = torch.empty((k, s * cp), device=w.device, dtype=w.dtype)
+    exe = compile_pack_weight(k, c, s, cp)
+    _dispatch(exe, wk, src, stream=torch.cuda.current_stream() if stream is None else stream)
+    _WEIGHT_CACHE[key] = (weakref.ref(anchor, functools.partial(_evict_weight, key)), wk, stamp)
+    return wk
+
+
+PAD_VEC = LDG_VEC
+PAD_THREADS = 256
+
+
+@functools.lru_cache(maxsize=64)
+def compile_pad_channels_ncdhw(n, c, s, cp, groups):
+    """Widen flat (N, C, S) -> (N, Cp, S) (S == T*H*W), zeroing each group's channel tail.
+
+    A destination row is either a verbatim copy of one source row or all zeros, so the
+    block folds both rows into its descriptors and every thread copies one vec8 at an
+    in-row offset. That keeps the addressing 32-bit however large ``N * Cp * S`` grows,
+    which is one of the reasons a shape lands here instead of on the transpose that
+    absorbs the widening.
+    """
     cg, cgp = c // groups, cp // groups
-    x = torch.nn.functional.pad(x.reshape(n, groups, cg, d, h, w), (0, 0, 0, 0, 0, 0, 0, cgp - cg))
-    return x.reshape(n, cp, d, h, w)
+    REMAP = groups > 1
+    elem_ty = fx.BFloat16
+    row_vecs = s // PAD_VEC
+    row_rem = s - row_vecs * PAD_VEC
+    grid_s = max(1, (row_vecs + PAD_THREADS - 1) // PAD_THREADS)
+
+    @flyc.kernel(known_block_size=[PAD_THREADS, 1, 1])
+    def pad_kernel(out: fx.Tensor, inp: fx.Tensor):
+        tid = fx.thread_idx.x
+        cc = fx.block_idx.y
+        nb = fx.block_idx.z
+        # `cc` is the DESTINATION channel, so a widened group maps it back to the channel
+        # it came from; the tail channels have no source row at all.
+        if const_expr(REMAP):
+            ci = cc % cgp
+            src_c = (cc // cgp) * cg + ci
+            in_chan = ci < cg
+        else:
+            src_c = cc
+            in_chan = cc < c
+        # A tail channel reads row 0 and throws the result away, which keeps the load
+        # unconditional and inside the input.
+        safe_c = arith.select(in_chan, fx.Index(src_c), fx.Index(0))
+        in_elem = (fx.Index(nb) * fx.Index(c) + fx.Index(safe_c)) * fx.Index(s)
+        out_elem = (fx.Index(nb) * fx.Index(cp) + fx.Index(cc)) * fx.Index(s)
+        in_addr = fx.Int64(buffer_ops.extract_base_index(inp)) + fx.Int64(in_elem) * fx.Int64(BF16_BYTES)
+        out_addr = fx.Int64(buffer_ops.extract_base_index(out)) + fx.Int64(out_elem) * fx.Int64(BF16_BYTES)
+        row_bytes = s * BF16_BYTES
+        in_rsrc = buffer_ops.create_buffer_resource_from_addr(in_addr, num_records_bytes=row_bytes)
+        out_rsrc = buffer_ops.create_buffer_resource_from_addr(out_addr, num_records_bytes=row_bytes)
+
+        lin = fx.block_idx.x * PAD_THREADS + tid
+        if lin < row_vecs:
+            off = fx.Int32(lin * PAD_VEC)
+            v = buffer_ops.buffer_load(in_rsrc, off, vec_width=PAD_VEC, dtype=elem_ty)
+            buffer_ops.buffer_store(arith.select(in_chan, v, fx.Vector.zeros_like(v)), out_rsrc, off)
+        # `s` need not be a multiple of the vector width, and a straddling vec8 would run
+        # into the row the descriptors do not cover, so the last few elements go singly.
+        if const_expr(row_rem):
+            if (fx.block_idx.x == 0) & (tid < row_rem):
+                off = fx.Int32(tid + row_vecs * PAD_VEC)
+                v = buffer_ops.buffer_load(in_rsrc, off, vec_width=1, dtype=elem_ty)
+                buffer_ops.buffer_store(arith.select(in_chan, v, 0.0), out_rsrc, off)
+
+    @flyc.jit
+    def launch_pad(out: fx.Tensor, inp: fx.Tensor, stream: fx.Stream = fx.Stream(None)):
+        pad_kernel(out, inp).launch(
+            grid=(grid_s, cp, n),
+            block=(PAD_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    def _launch(out, inp, stream=None):
+        with CompilationContext.compile_hints(CONV_COMPILE_HINTS):
+            return launch_pad(out, inp, stream=_as_stream(stream))
+
+    def _compile(out, inp, stream=None):
+        with CompilationContext.compile_hints(CONV_COMPILE_HINTS):
+            return flyc.compile(launch_pad, out, inp, _as_stream(stream))
+
+    _launch.compile = _compile
+    return _launch
+
+
+def _pad_channels_ncdhw(x, cp, groups, stream=None):
+    """Widen each group's channel block to ``cp // groups`` with zeros, in NCDHW."""
+    assert x.dtype == torch.bfloat16, f"_pad_channels_ncdhw is bf16-only; got {x.dtype}"
+    n, c, d, h, w = x.shape
+    src = x if x.is_contiguous() else x.contiguous()
+    out = torch.empty((n, cp, d, h, w), device=x.device, dtype=x.dtype)
+    exe = compile_pad_channels_ncdhw(n, c, d * h * w, cp, groups)
+    _dispatch(exe, out, src, stream=torch.cuda.current_stream() if stream is None else stream)
+    return out
+
+
+PAD_SPATIAL_VEC = LDG_VEC
+PAD_SPATIAL_THREADS = 256
+
+
+def _pad_map(i, lo, hi, ext, mode):
+    """Source index on one padded axis for destination index ``i``.
+
+    ``reflect`` mirrors without repeating the edge, ``circular`` wraps and ``replicate``
+    clamps; the caller has already bounded every pad to one period, so one step of each
+    is enough. Each branch is written in terms of the non-negative ``i`` so no live
+    intermediate has to represent a negative index.
+    """
+    if lo == 0 and hi == 0:
+        return i
+    if mode == "replicate":
+        low, high = 0, ext - 1
+    elif mode == "reflect":
+        low, high = fx.Index(lo) - i, fx.Index(2 * ext - 2 + lo) - i
+    else:
+        low, high = i + (ext - lo), i - (lo + ext)
+    return fx.Index(arith.select(i >= lo + ext, high, arith.select(i < lo, low, i - lo)))
+
+
+@functools.lru_cache(maxsize=32)
+def compile_pad_spatial(n, c, d, h, w, pads, mode, ndhwc):
+    """Materialize (D, H, W) padding in the input's own layout, ``pads`` in torch's order.
+
+    Every destination row -- one (batch, [channel], dd, hh) -- is the w-padded copy of
+    exactly one source row, whichever row the d and h maps pick. So the work splits into
+    a vectorized copy of that source row into the row's interior, which is nearly all of
+    it, and the mapped columns on either side. The two layouts differ only in what a row
+    holds: W elements of one channel in NCDHW, W * C channel-major ones in NDHWC.
+
+    Addressing is 64-bit per thread, since this path exists precisely because the padded
+    activation does not fit a 32-bit element offset.
+    """
+    pw_lo, pw_hi, ph_lo, ph_hi, pd_lo, pd_hi = pads
+    dp, hp, wp = d + pd_lo + pd_hi, h + ph_lo + ph_hi, w + pw_lo + pw_hi
+    elem_ty = fx.BFloat16
+    inner = c if ndhwc else 1
+    rows = n * dp * hp * (1 if ndhwc else c)
+    src_row, dst_row = w * inner, wp * inner
+    npad = pw_lo + pw_hi
+
+    VEC = PAD_SPATIAL_VEC
+    row_vecs = (src_row + VEC - 1) // VEC
+    # A vec8 of the interior sits at `pw_lo * inner` in the destination row, so the two
+    # ends agree on 16B alignment only when the rows and that shift are all multiples of
+    # the vector. Where they are not, the honest alignment still lowers to one dwordx4.
+    a_align = VEC * BF16_BYTES if (src_row | dst_row | (pw_lo * inner)) % VEC == 0 else BF16_BYTES
+    # A pad column moves a whole `inner` run, which is one element in NCDHW.
+    b_vec = VEC if inner % VEC == 0 else 1
+    b_runs = inner // b_vec
+
+    a_threads = rows * row_vecs
+    b_threads = rows * npad * b_runs
+    grid_a = (a_threads + PAD_SPATIAL_THREADS - 1) // PAD_SPATIAL_THREADS
+    grid_b = (b_threads + PAD_SPATIAL_THREADS - 1) // PAD_SPATIAL_THREADS
+
+    @flyc.kernel(known_block_size=[PAD_SPATIAL_THREADS, 1, 1])
+    def pad_spatial_kernel(out: fx.Tensor, inp: fx.Tensor):
+        # Index, not the native i32 of the launch ids: a row offset alone overflows 32
+        # bits on the tensors that come here.
+        tid = fx.Index(fx.thread_idx.x)
+        bid = fx.Index(fx.block_idx.x)
+        base_in = fx.Int64(buffer_ops.extract_base_index(inp))
+        base_out = fx.Int64(buffer_ops.extract_base_index(out))
+
+        class BF16Ty:
+            ir_type = elem_ty.ir_type
+
+        a_ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, a_align)
+        b_ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, b_vec * BF16_BYTES)
+        one_ptr_ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, BF16_BYTES)
+        a_res_ty = fx.Vector.make_type(VEC, elem_ty)
+        b_res_ty = fx.Vector.make_type(b_vec, elem_ty) if b_vec > 1 else BF16Ty
+
+        def copy(dst_elem, src_elem, ptr_ty, res_ty):
+            v = fx.ptr_load(
+                fx.inttoptr(ptr_ty, base_in + fx.Int64(src_elem) * fx.Int64(BF16_BYTES)),
+                result_type=res_ty,
+            )
+            fx.ptr_store(v, fx.inttoptr(ptr_ty, base_out + fx.Int64(dst_elem) * fx.Int64(BF16_BYTES)))
+
+        def src_row_of(row):
+            """Which source row a destination row copies, once d and h are mapped."""
+            hh = row % hp
+            t = row // hp
+            dd = t % dp
+            t = t // dp
+            return (t * d + _pad_map(dd, pd_lo, pd_hi, d, mode)) * h + _pad_map(hh, ph_lo, ph_hi, h, mode)
+
+        # The interior: one whole source row per destination row, vector by vector.
+        if bid < grid_a:
+            vi = bid * PAD_SPATIAL_THREADS + tid
+            if vi < a_threads:
+                row = vi // row_vecs
+                j = (vi % row_vecs) * VEC
+                src = src_row_of(row) * src_row + j
+                dst = row * dst_row + pw_lo * inner + j
+                if const_expr(src_row % VEC == 0):
+                    copy(dst, src, a_ptr_ty, a_res_ty)
+                elif j + VEC <= src_row:
+                    copy(dst, src, a_ptr_ty, a_res_ty)
+                else:
+                    # Only a row's last vector straddles the end, so this stays off the
+                    # path the bulk of the copy takes.
+                    for e in range_constexpr(VEC):
+                        if j + e < src_row:
+                            copy(dst + e, src + e, one_ptr_ty, BF16Ty)
+
+        # The w pads: one mapped source column each, and there are only pw_lo + pw_hi of
+        # them per row, so they are left unvectorized along w.
+        if const_expr(b_threads):
+            if bid >= grid_a:
+                bi = (bid - grid_a) * PAD_SPATIAL_THREADS + tid
+                if bi < b_threads:
+                    iv = (bi % b_runs) * b_vec
+                    t = bi // b_runs
+                    pi = t % npad
+                    row = t // npad
+                    ww = fx.Index(arith.select(pi < pw_lo, pi, pi + (wp - pw_hi - pw_lo)))
+                    sw = _pad_map(ww, pw_lo, pw_hi, w, mode)
+                    copy(
+                        row * dst_row + ww * inner + iv,
+                        src_row_of(row) * src_row + sw * inner + iv,
+                        b_ptr_ty,
+                        b_res_ty,
+                    )
+
+    @flyc.jit
+    def launch_pad_spatial(out: fx.Tensor, inp: fx.Tensor, stream: fx.Stream = fx.Stream(None)):
+        pad_spatial_kernel(out, inp).launch(
+            grid=(grid_a + grid_b, 1, 1),
+            block=(PAD_SPATIAL_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    def _launch(out, inp, stream=None):
+        with CompilationContext.compile_hints(CONV_COMPILE_HINTS):
+            return launch_pad_spatial(out, inp, stream=_as_stream(stream))
+
+    def _compile(out, inp, stream=None):
+        with CompilationContext.compile_hints(CONV_COMPILE_HINTS):
+            return flyc.compile(launch_pad_spatial, out, inp, _as_stream(stream))
+
+    _launch.compile = _compile
+    return _launch
+
+
+def _pad_spatial(x, ndhwc, pads, mode, stream=None):
+    """Materialize (D, H, W) padding, torch's (w_lo, w_hi, h_lo, h_hi, d_lo, d_hi) order.
+
+    Only the non-zero padding modes reach this. Zero padding is entirely a matter of the
+    gather's range mask and the output extent, so it never needs a padded copy of the
+    activation, however lopsided the pad is.
+
+    The copy stays in the layout it was handed, and reports which one that is, so a
+    channels-last activation is not transposed here only to be transposed back before
+    the GEMM.
+    """
+    assert x.dtype == torch.bfloat16, f"_pad_spatial is bf16-only; got {x.dtype}"
+    n, c, d, h, w = _shape_ncdhw(x, ndhwc)
+    pw_lo, pw_hi, ph_lo, ph_hi, pd_lo, pd_hi = pads
+    dp, hp, wp = d + pd_lo + pd_hi, h + ph_lo + ph_hi, w + pw_lo + pw_hi
+    shape = (n, dp, hp, wp, c) if ndhwc else (n, c, dp, hp, wp)
+    src = x if x.is_contiguous() else x.contiguous()
+    out = torch.empty(shape, device=x.device, dtype=x.dtype)
+    exe = compile_pad_spatial(n, c, d, h, w, tuple(pads), mode, ndhwc)
+    _dispatch(exe, out, src, stream=torch.cuda.current_stream() if stream is None else stream)
+    return out, ndhwc
 
 
 def _ncdhw_to_ndhwc(x, stream, cp=None, groups=1):
@@ -403,7 +725,7 @@ def _ncdhw_to_ndhwc(x, stream, cp=None, groups=1):
 
     ``cp`` asks for each group's channels to be widened to ``cp // groups`` on the way
     out. Folding that into the transpose is what keeps an unaligned-C input to a single
-    launch; only the paths that cannot fuse it fall back to a separate ``F.pad``.
+    launch; only the paths that cannot fuse it fall back to a separate widening launch.
     """
     n, c, t, h, w = x.shape
     cp = c if cp is None else cp
@@ -425,7 +747,7 @@ def _ncdhw_to_ndhwc(x, stream, cp=None, groups=1):
     if cp != c:
         # Widening it separately is the slow way round, but the transpose itself may
         # still be the kernel's to do.
-        return _ncdhw_to_ndhwc(_pad_channels_ncdhw(x, cp, groups), stream)
+        return _ncdhw_to_ndhwc(_pad_channels_ncdhw(x, cp, groups, stream), stream)
     return x.permute(0, 2, 3, 4, 1).contiguous()
 
 
@@ -567,6 +889,13 @@ def compile_conv3d_implicit(
     ), f"grid.z = {m_chunks} M-chunks x {splitk} splits exceeds the {MAX_GRID_YZ}-block limit"
 
     WGM = 1 if m_chunks > 1 else max(1, int(wgm))
+
+    # Applied to the (x, y) plane only, which stays correct under a z axis (split-K) exactly
+    # when that plane is a whole number of XCD rounds: the dispatch id is pid + z * grid_xy,
+    # so grid_xy % NUM_XCDS == 0 leaves pid % NUM_XCDS -- the XCD a block lands on -- the
+    # same in every z slice. M chunking is excluded because it decodes x and z together.
+    grid_xy = grid_m * grid_n
+    USE_XCD = m_chunks == 1 and grid_xy > XCD_SWIZZLE_MIN_BLOCKS and grid_xy % NUM_XCDS == 0
     elem_ty = fx.BFloat16
     mfma_fn = rocdl.mfma_f32_16x16x32_bf16
     temporal_only_fast = (
@@ -657,16 +986,25 @@ def compile_conv3d_implicit(
             m_chunk = fx.Index(fx.block_idx.z) % fx.Index(m_chunks)
             m_offset = (fx.Index(fx.block_idx.x) + m_chunk * fx.Index(grid_x)) * TILE_M
             n_tile = fx.block_idx.y
-        elif const_expr(WGM > 1):
+        elif const_expr(WGM > 1 or USE_XCD):
             pid = fx.Index(fx.block_idx.x) + fx.Index(fx.block_idx.y) * fx.Index(grid_m)
-            blocks_per_swizzle = fx.Index(WGM * grid_n)
-            swizzle_id = pid // blocks_per_swizzle
-            first_m = swizzle_id * fx.Index(WGM)
-            swizzle_rows = fx.Index(grid_m) - first_m
-            swizzle_rows = fx.Index(arith.select(swizzle_rows < fx.Index(WGM), swizzle_rows, fx.Index(WGM)))
-            local = pid % blocks_per_swizzle
-            m_offset = fx.Index(first_m + (local % swizzle_rows)) * TILE_M
-            n_tile = fx.Index(local // swizzle_rows)
+            if const_expr(USE_XCD):
+                # Gather each XCD's round-robin share into one contiguous run of ids.
+                pid = (pid % fx.Index(NUM_XCDS)) * fx.Index(grid_xy // NUM_XCDS) + pid // fx.Index(NUM_XCDS)
+            if const_expr(WGM > 1):
+                blocks_per_swizzle = fx.Index(WGM * grid_n)
+                swizzle_id = pid // blocks_per_swizzle
+                first_m = swizzle_id * fx.Index(WGM)
+                swizzle_rows = fx.Index(grid_m) - first_m
+                swizzle_rows = fx.Index(arith.select(swizzle_rows < fx.Index(WGM), swizzle_rows, fx.Index(WGM)))
+                local = pid % blocks_per_swizzle
+                m_offset = fx.Index(first_m + (local % swizzle_rows)) * TILE_M
+                n_tile = fx.Index(local // swizzle_rows)
+            else:
+                # Plain row-major, M fastest -- the order the no-swizzle branch below emits,
+                # rebuilt from the remapped id so the wide-tile reasoning still holds.
+                m_offset = (pid % fx.Index(grid_m)) * TILE_M
+                n_tile = pid // fx.Index(grid_m)
         else:
             m_offset = fx.block_idx.x * TILE_M
             n_tile = fx.block_idx.y
@@ -1415,7 +1753,7 @@ def _conv3d_impl(
     inline_pad = padding_mode != "zeros" and (any(pad_lo) or any(pad_hi))
     if inline_pad and _big_in(n, c, groups, d, h, w, *map(max, pad_lo, pad_hi)):
         pads = (pad_lo[2], pad_hi[2], pad_lo[1], pad_hi[1], pad_lo[0], pad_hi[0])
-        x, in_ndhwc = _pad_spatial(x, in_ndhwc, pads, padding_mode)
+        x, in_ndhwc = _pad_spatial(x, in_ndhwc, pads, padding_mode, stream)
         n, c, d, h, w = _shape_ncdhw(x, in_ndhwc)
         pad_lo = pad_hi = (0, 0, 0)
         pt, ph, pw = pad_lo
@@ -1498,7 +1836,7 @@ def _conv3d_impl(
         x_arg = x.contiguous()
     else:
         x_arg = _ncdhw_to_ndhwc(x, launch_stream, c, groups)
-    w_packed = _prep_weight(weight, k, kt, kh, kw, wc)
+    w_packed = _prep_weight(weight, k, kt, kh, kw, wc, launch_stream)
 
     shape = (
         # fmt: off
