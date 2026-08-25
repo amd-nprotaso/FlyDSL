@@ -1259,11 +1259,14 @@ def compile_conv3d_implicit(
         def _dma_to_lds(src, dst, voff_elem):
             fx.copy(_dma_atom, fx.slice(src, (None, voff_elem)), dst)
 
-        def _load_a(stage, k_base):
+        def _load_a(stage, k_base, steps=None):
+            # `steps` selects a subset of the tile's issues, so the main loop can hand one
+            # DMA at a time to a cluster instead of emitting the whole burst at once.
+            steps = range_constexpr(LDG_A_COUNT) if steps is None else steps
             kbase_i = fx.Index(k_base)
             stage_tile = fx.Index(stage) * TILE_M * TILE_K
             if const_expr(NCHW_A):
-                for i in range_constexpr(LDG_A_COUNT):
+                for i in steps:
                     g_off_i, valid = _a_addr_nchw(i, kbase_i)
                     voff = fx.Int32(arith.select(valid, g_off_i, OOB_ELEM))
                     _dma_to_lds(x_src, _lds_dma_ptr(a_lds, stage_tile, i), voff)
@@ -1274,7 +1277,7 @@ def compile_conv3d_implicit(
                 if const_expr(groups > 1):
                     cc_base = ch_base + cc_base
                 ckk_base = kbase_i // CGP
-            for i in range_constexpr(LDG_A_COUNT):
+            for i in steps:
                 if const_expr(BIG_IN_NM):
                     addr_ret = _a_addr(i, kbase_i, cc_base, ckk_base)
                     g_off_i, valid, n_idx_i = addr_ret
@@ -1286,9 +1289,10 @@ def compile_conv3d_implicit(
                     voff = fx.Int32(arith.select(valid, g_off_i, OOB_ELEM))
                     _dma_to_lds(x_src, _lds_dma_ptr(a_lds, stage_tile, i), voff)
 
-        def _load_b(stage, k_base):
+        def _load_b(stage, k_base, steps=None):
+            steps = range_constexpr(LDG_B_COUNT) if steps is None else steps
             stage_tile = fx.Index(stage) * TILE_N * TILE_K
-            for i in range_constexpr(LDG_B_COUNT):
+            for i in steps:
                 g_off, col_valid = _b_addr(i, k_base)
                 if const_expr(n_tail):
                     voff = fx.Int32(arith.select(col_valid, g_off, OOB_ELEM))
@@ -1326,30 +1330,108 @@ def compile_conv3d_implicit(
                 [a_frag, b_frag, c_frag, 0, 0, 0],
             )
 
-        def read_a_frags(stage):
-            frags = [read_a_vec(stage, mi) for mi in range_constexpr(MI_M)]
-            # The transposed path spends two ds_read_tr per fragment, not one ds_read_b128.
-            rocdl.sched_dsrd(2 * MI_M if const_expr(NCHW_A) else MI_M)
-            return frags
+        # ---- 4-wave interleaved clusters ----
+        #
+        # The per-wave MFMA grid is cut into 2x2 quadrants of operand halves and a K tile is
+        # issued as four clusters, one per quadrant. A cluster runs its quadrant's MFMAs
+        # while reading an operand half that a *later* cluster consumes, so a ds_read is
+        # always covered by MFMAs that do not depend on it. This is the schedule the 4-wave
+        # fp8 GEMM (``kernels/gemm/fp8_gemm_4wave.py``) rotates over its eight LDS
+        # partitions, rebuilt over the halves of the tiles inside one barrier region -- which
+        # is what lets it reuse this kernel's LDS layout and one-barrier-per-batch discipline
+        # unchanged.
+        #
+        # Ordering constraint: a ds_read placed after a buffer_load_lds issue costs an
+        # LLVM-inserted `s_waitcnt vmcnt(0)`, because the DMA store carries no alias scope
+        # and SIInsertWaitcnts has to assume it may alias the read. That drains the whole
+        # prefetch, so the reads of a barrier region are all scheduled ahead of its DMA
+        # issues: reads fill the leading clusters, the trailing read-free clusters take the
+        # DMAs. Interleaving the two, which is what the fp8 GEMM does, is a 12-28% loss here.
+        #
+        # Halves are index ranges rather than a count so an odd MI_M / MI_N degenerates
+        # instead of needing a second loop: an empty high half leaves its two clusters with
+        # no MFMAs and no read, and the tile collapses back to two clusters.
+        PREFETCH = TILES_PER_BARRIER
+        A_DSRD = 2 if NCHW_A else 1  # ds_read per A fragment; the transposed path spends two
+        M_HALVES = (range_constexpr(0, (MI_M + 1) // 2), range_constexpr((MI_M + 1) // 2, MI_M))
+        N_HALVES = (range_constexpr(0, (MI_N + 1) // 2), range_constexpr((MI_N + 1) // 2, MI_N))
 
-        def read_b_frags(stage):
-            frags = [read_b_vec(stage, ni) for ni in range_constexpr(MI_N)]
-            rocdl.sched_dsrd(MI_N)
-            return frags
+        def read_a_frags(stage, mis):
+            return [read_a_vec(stage, mi) for mi in mis]
 
-        def do_compute(acc_values, a_frag_values, b_frag_values):
+        def read_b_frags(stage, nis):
+            return [read_b_vec(stage, ni) for ni in nis]
+
+        def quadrant_mfmas(a_frag_values, b_frag_values, qm, qn):
+            """MFMA thunks for quadrant (qm, qn).
+
+            The operand lists are indexed inside the thunk rather than captured by value,
+            so the cluster that fills a half can be emitted before the one that reads it.
+            """
+            ops = []
+            for i in range_constexpr(len(M_HALVES[qm])):
+                for j in range_constexpr(len(N_HALVES[qn])):
+
+                    def op(i=i, j=j, idx=M_HALVES[qm][i] * MI_N + N_HALVES[qn][j]):
+                        acc[idx] = mfma_one(a_frag_values[i], b_frag_values[j], acc[idx])
+
+                    ops.append(op)
+            return ops
+
+        def read_op(dst, read, stage, idxs, per_frag):
+            """Side op appending `idxs`' fragments to `dst`; empty when there is no read."""
+            if const_expr(stage is None or not len(idxs)):
+                return []
+            return [(rocdl.sched_dsrd, len(idxs) * per_frag, lambda: dst.extend(read(stage, idxs)))]
+
+        def dma_ops(kt):
+            """One side op per global->LDS issue of the tile PREFETCH ahead of `kt`."""
+            nxt = kt + PREFETCH
+            if const_expr(nxt >= tiles_per_split):
+                return []
+            stage, k_base = nxt % PIPE_STAGES, k_off + nxt * TILE_K
+            return [
+                (rocdl.sched_vmem, 1, functools.partial(load, stage, k_base, (i,)))
+                for load, count in ((_load_a, LDG_A_COUNT), (_load_b, LDG_B_COUNT))
+                for i in range_constexpr(count)
+            ]
+
+        def cluster(mfma_ops, side_ops):
+            """One quadrant's MFMAs with `side_ops` spread evenly between them.
+
+            The scheduling groups are emitted in the same interleaved order, so the post-RA
+            scheduler keeps the pattern instead of hoisting every ds_read to the top of the
+            region the way a single dsrd/mfma group pair would let it.
+            """
+            n_m, n_s = len(mfma_ops), len(side_ops)
+            if const_expr(n_m == 0):
+                for si in range_constexpr(n_s):
+                    sched, count, run = side_ops[si]
+                    run()
+                    sched(count)
+                return
+            # Side op `si` goes after MFMA `si * n_m // n_s`, which spreads them evenly and
+            # puts the first one early -- the ds_read is listed first, so it issues with the
+            # most MFMAs left to cover it.
+            slots = [[] for _ in range_constexpr(n_m)]
+            for si in range_constexpr(n_s):
+                slots[si * n_m // n_s].append(side_ops[si])
             rocdl.s_setprio(1)
-            for mi in range_constexpr(MI_M):
-                for ni in range_constexpr(MI_N):
-                    idx = mi * MI_N + ni
-                    acc_values[idx] = mfma_one(a_frag_values[mi], b_frag_values[ni], acc_values[idx])
-                rocdl.sched_mfma(MI_N)
+            pending = 0
+            for mi in range_constexpr(n_m):
+                mfma_ops[mi]()
+                pending += 1
+                for sched, count, run in slots[mi]:
+                    run()
+                    rocdl.sched_mfma(pending)
+                    sched(count)
+                    pending = 0
+            if const_expr(pending):
+                rocdl.sched_mfma(pending)
             rocdl.s_setprio(0)
-            return acc_values
 
         # global->LDS software pipeline
         # ---- prologue: fill the pipeline with the first PREFETCH tiles' DMAs ----
-        PREFETCH = TILES_PER_BARRIER
         for s in range_constexpr(PREFETCH):
             if const_expr(s < tiles_per_split):
                 _load_a(s, k_off + s * TILE_K)
@@ -1359,20 +1441,63 @@ def compile_conv3d_implicit(
         for kt_idx in range_constexpr(0, tiles_per_split, TILES_PER_BARRIER):
             batch = range_constexpr(kt_idx, min(kt_idx + TILES_PER_BARRIER, tiles_per_split))
 
+            nb = len(batch)
+            stages = [kt % PIPE_STAGES for kt in batch]
+            a_lo = [[] for _ in range_constexpr(nb)]
+            a_hi = [[] for _ in range_constexpr(nb)]
+            b_lo = [[] for _ in range_constexpr(nb)]
+            b_hi = [[] for _ in range_constexpr(nb)]
+
             barrier(vmcnt=0, lgkmcnt=0)
-            a_frags = [read_a_frags(kt % PIPE_STAGES) for kt in batch]
-            b_frags = [read_b_frags(kt % PIPE_STAGES) for kt in batch]
-            issued = 0
-            for kt in batch:
-                nxt = kt + PREFETCH
-                if const_expr(nxt < tiles_per_split):
-                    _load_a(nxt % PIPE_STAGES, k_off + nxt * TILE_K)
-                    _load_b(nxt % PIPE_STAGES, k_off + nxt * TILE_K)
-                    issued += LDG_A_COUNT + LDG_B_COUNT
-            if const_expr(issued):
-                rocdl.sched_vmem(issued)
-            for j in range_constexpr(len(batch)):
-                acc = do_compute(acc, a_frags[j], b_frags[j])
+            # The first tile's low halves are the one pair of reads with nothing to hide
+            # behind: the barrier that makes them readable cuts them off from the MFMAs that
+            # would have covered them. Every other half is read a cluster or more ahead.
+            a_lo[0].extend(read_a_frags(stages[0], M_HALVES[0]))
+            b_lo[0].extend(read_b_frags(stages[0], N_HALVES[0]))
+            rocdl.sched_dsrd(len(a_lo[0]) * A_DSRD + len(b_lo[0]))
+
+            # Read side ops per cluster, in emission order: the first tile fills its own high
+            # halves; every later tile is filled whole during its predecessor's back half.
+            reads = []
+            for bi in range_constexpr(nb):
+                first = second = []
+                if const_expr(bi == 0):
+                    first = read_op(b_hi[0], read_b_frags, stages[0], N_HALVES[1], 1) + read_op(
+                        a_hi[0], read_a_frags, stages[0], M_HALVES[1], A_DSRD
+                    )
+                if const_expr(bi + 1 < nb):
+                    nxt = bi + 1
+                    second = (
+                        read_op(a_lo[nxt], read_a_frags, stages[nxt], M_HALVES[0], A_DSRD)
+                        + read_op(b_lo[nxt], read_b_frags, stages[nxt], N_HALVES[0], 1)
+                        + read_op(a_hi[nxt], read_a_frags, stages[nxt], M_HALVES[1], A_DSRD)
+                        + read_op(b_hi[nxt], read_b_frags, stages[nxt], N_HALVES[1], 1)
+                    )
+                reads += [first, second, [], []]
+
+            # The batch's DMAs go to the clusters that follow its last read, spread evenly so
+            # each issue is separated from the next by MFMAs.
+            dma = []
+            for bi in range_constexpr(nb):
+                dma += dma_ops(batch[bi])
+            last_read = max([ci for ci in range_constexpr(len(reads)) if len(reads[ci])] + [-1])
+            free = [ci for ci in range_constexpr(last_read + 1, len(reads))]
+            dmas = [[] for _ in range_constexpr(len(reads))]
+            for di in range_constexpr(len(dma)):
+                dmas[free[di * len(free) // len(dma)]].append(dma[di])
+
+            for bi in range_constexpr(nb):
+                for q in range_constexpr(4):
+                    qm, qn = q // 2, q % 2
+                    cluster(
+                        quadrant_mfmas(
+                            a_lo[bi] if qm == 0 else a_hi[bi],
+                            b_lo[bi] if qn == 0 else b_hi[bi],
+                            qm,
+                            qn,
+                        ),
+                        reads[bi * 4 + q] + dmas[bi * 4 + q],
+                    )
 
         _row_chk = (npq % TILE_M != 0) or (grid_x * m_chunks > grid_m)
         _need_chk = _row_chk or n_tail
