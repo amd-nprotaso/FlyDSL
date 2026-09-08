@@ -33,12 +33,21 @@ if not torch.cuda.is_available():
 import pytest  # noqa: E402
 
 from flydsl.runtime.device import get_rocm_arch  # noqa: E402
+from kernels.attention import flash_attn_interface  # noqa: E402
+from kernels.attention.flash_attn_gfx950 import build_flash_attn_dualwave_swp_module  # noqa: E402
 from kernels.attention.flash_attn_interface import flydsl_flash_attn_func  # noqa: E402
+from kernels.attention.flash_attn_utils import (  # noqa: E402
+    BIAS_MAX_DESCRIPTOR_BYTES,
+    BIAS_MAX_OFFSET_ELEMS,
+    bias_addressing_error,
+)
 from tests.test_common import run_perftest  # noqa: E402
 
 UNIFORM_RANGE = (-1, 1)
 DEFAULT_SEED = 123
 PAGED_KV_MIN_CONTEXT_LENGTH = 16384
+# Target share of the softmax mass placed on the attention sink (see calibrate_sink).
+DEFAULT_SINK_SHARE = 0.5
 # fp8 correctness gate (fixed; fp8 is lossy).
 FP8_MAX_ERR = 5e-2
 FP8_MIN_COS = 0.98
@@ -143,6 +152,42 @@ EXTRA_CONFIGS = [
     [[127, 129, 255, 257], [257, 255, 129, 127], None, 64, 8, 1],
 ]
 
+FP8_VARLEN_Q_SEQLENS = {
+    1: [2614],
+    2: [1024, 1590],
+    3: [1024, 512, 1078],
+    4: [1024, 512, 256, 822],
+}
+FP8_VARLEN_KV_SEQLENS = {
+    1: [16384],
+    2: [8192, 8192],
+    3: [8192, 4096, 4096],
+    4: [8192, 4096, 2048, 2048],
+}
+FP8_VARLEN_BATCHES = (1, 2, 3, 4)
+
+FP8_SPLITKV_SPLITS = (2, 4, 8, 16)
+FP8_SPLITKV_SEQLENS = (4096, 8192, 16384, 32768)
+
+FP8_EXTRA_CONFIGS = (
+    [[FP8_VARLEN_Q_SEQLENS[b], None, None, 12, 12, 1, 192, 128] for b in FP8_VARLEN_BATCHES]
+    + [[FP8_VARLEN_Q_SEQLENS[b], FP8_VARLEN_KV_SEQLENS[b], None, 12, 12, 1, 192, 128] for b in FP8_VARLEN_BATCHES]
+    + [
+        [seq, seq, b, 12, 12, 1, 192, 128]
+        for seq in (4096, 8192, 16384, 32768)
+        for b in ((1, 2) if seq == 32768 else (1, 2, 3, 4))
+    ]
+    + [[seq, seq, 1, 12, 12, sp, 192, 128] for seq, sp in zip(FP8_SPLITKV_SEQLENS, FP8_SPLITKV_SPLITS)]
+    + [[8192, 8192, b, 12, 12, 4, 192, 128] for b in (2, 3, 4)]
+    + [[8192, 8192, 1, 12, 12, sp, 128, 128] for sp in FP8_SPLITKV_SPLITS]
+    + [
+        [512, 16384, 1, 12, 12, 8, 192, 128],
+        [2614, 16384, 1, 12, 12, 8, 192, 128],
+        [1024, 32768, 1, 12, 12, 16, 192, 128],
+        [512, 16384, 4, 12, 12, 8, 192, 128],
+    ]
+)
+
 
 def _short_label(value):
     label = str(value)
@@ -150,7 +195,8 @@ def _short_label(value):
 
 
 def _extra_case_from_config(row):
-    seqlen_q, seqlen_kv, batch, nh, nh_kv, kv_splits = row
+    seqlen_q, seqlen_kv, batch, nh, nh_kv, kv_splits, *head_dims = row
+    dims = {"hd": head_dims[0], "hd_v": head_dims[1]} if head_dims else {}
     if seqlen_kv is None:
         return {
             "sq_label": _short_label(seqlen_q),
@@ -159,6 +205,7 @@ def _extra_case_from_config(row):
             "nh_kv": nh_kv,
             "kv_splits": kv_splits,
             "kwargs": {"varlen_seqlens_q": list(seqlen_q)},
+            **dims,
         }
     if batch is not None:
         return {
@@ -168,6 +215,7 @@ def _extra_case_from_config(row):
             "nh_kv": nh_kv,
             "kv_splits": kv_splits,
             "kwargs": {"batch": batch, "seqlen_q": seqlen_q, "seqlen_kv": seqlen_kv},
+            **dims,
         }
     return {
         "sq_label": _short_label(seqlen_q),
@@ -176,6 +224,7 @@ def _extra_case_from_config(row):
         "nh_kv": nh_kv,
         "kv_splits": kv_splits,
         "kwargs": {"varlen_seqlens_q": list(seqlen_q), "varlen_seqlens_kv": list(seqlen_kv)},
+        **dims,
     }
 
 
@@ -187,7 +236,104 @@ def setup_seed(seed: int) -> None:
     torch.backends.cudnn.deterministic = True
 
 
-def pytorch_ref_attention(q, k, v, causal=True):
+def make_alibi_slopes(batch, num_heads, two_d=False, device="cuda"):
+    """Positive fp32 ALiBi slopes, [batch, num_heads] if two_d else [num_heads].
+
+    The canonical geometric ladder 2**(-8*(h+1)/H) with a per-batch jitter on the
+    2D form, so a bug that broadcast or swapped the head/batch index cannot alias
+    into a pass. Deterministic: consumes no RNG, so Q/K/V stay bit-identical to a
+    run without ALiBi.
+    """
+    base = torch.tensor(
+        [2.0 ** (-((h + 1) * 8.0 / num_heads)) for h in range(num_heads)], dtype=torch.float32, device=device
+    )
+    if not two_d:
+        return base.contiguous()
+    jitter = 1.0 + 0.25 * torch.arange(batch, dtype=torch.float32, device=device)[:, None]
+    return (base[None, :] * jitter).contiguous()
+
+
+def _alibi_term(alibi_slopes, q_lo, q_hi, delta, key_idx):
+    """-slope * |i + delta - j| for q rows [q_lo, q_hi) -> [B or 1, H, q_hi-q_lo, Skv].
+
+    Built per Q chunk rather than materialized whole: a full [B, H, Sq, Skv] fp32
+    ALiBi matrix is the same size as the score matrix the caller is already
+    chunking to avoid.
+    """
+    i = torch.arange(q_lo, q_hi, device=alibi_slopes.device)[:, None]
+    rel = (i + delta - key_idx.view(1, -1)).abs().to(torch.float32)
+    s = alibi_slopes.float()
+    if s.dim() == 1:
+        s = s.unsqueeze(0)
+    return -s[:, :, None, None] * rel
+
+
+def _rows_logsumexp(q_t, k_t, causal, bias=None, alibi_slopes=None):
+    """Per-head sum and count of row logsumexp(scores), chunked over Q.
+
+    q_t: [B, Sq, H, D], k_t: [B, Skv, Hkv, D]. Returns (sum_per_head, count),
+    both fp32 [H] / scalar, over finite rows only.
+    """
+    q_h = q_t.transpose(1, 2).float()
+    k_h = k_t.transpose(1, 2).float()
+    B, H, Sq, D = q_h.shape
+    Skv = k_h.shape[2]
+    if H != k_h.shape[1]:
+        k_h = k_h.repeat_interleave(H // k_h.shape[1], dim=1)
+    delta = Skv - Sq
+    scale = 1.0 / math.sqrt(D)
+    k_trans = k_h.transpose(-1, -2).contiguous()
+    key_idx = torch.arange(Skv, device=q_t.device).view(1, 1, 1, Skv)
+    chunk = max(1, min(Sq, (64 * 1024 * 1024) // max(B * H * Skv, 1)))
+    total = torch.zeros(H, dtype=torch.float32, device=q_t.device)
+    count = 0
+    for s0 in range(0, Sq, chunk):
+        s1 = min(s0 + chunk, Sq)
+        sc = torch.matmul(q_h[:, :, s0:s1, :], k_trans) * scale
+        if alibi_slopes is not None:
+            sc = sc + _alibi_term(alibi_slopes, s0, s1, delta, key_idx)
+        if bias is not None:
+            sc = sc + bias[s0:s1].float()
+        if causal:
+            q_idx = torch.arange(s0, s1, device=q_t.device).view(1, 1, -1, 1)
+            sc = sc.masked_fill(key_idx > q_idx + delta, float("-inf"))
+        lse = torch.logsumexp(sc, dim=-1)  # [B, H, chunk]
+        finite = torch.isfinite(lse)
+        total += torch.where(finite, lse, torch.zeros_like(lse)).sum(dim=(0, 2))
+        count += int(finite[:, 0, :].sum().item()) if finite.numel() else 0
+    return total, max(count, 1)
+
+
+def calibrate_sink(sum_lse, count, share):
+    """Per-head sink logit placing `share` of the softmax mass on the sink.
+
+    share = sigmoid(sink - logsumexp(scores)), so invert it per head. Calibration
+    matters: logsumexp grows like ln(seqlen), so a sink drawn near 0 would own a
+    fraction of a percent of the mass -- below the bf16 noise floor, and a row
+    with a dropped sink would pass just as happily.
+    """
+    return (sum_lse / count + math.log(share / (1.0 - share))).float().contiguous()
+
+
+def _sink_softmax(scores, sink):
+    """softmax over [scores, sink], where the sink carries no value row.
+
+    Returns probs summing to 1 - sink_share. A fully-masked row needs no
+    special-casing: the max collapses to the sink, every score term is
+    exp(-inf) = 0, and the row becomes all-sink -- probs 0, matching the kernel.
+    """
+    s = sink.view(1, -1, 1, 1)
+    m = torch.maximum(scores.amax(dim=-1, keepdim=True), s)
+    e = torch.exp(scores - m)
+    return e / (e.sum(dim=-1, keepdim=True) + torch.exp(s - m))
+
+
+def pytorch_ref_attention(q, k, v, causal=True, bias=None, alibi_slopes=None, sink=None):
+    if bias is not None or alibi_slopes is not None or sink is not None:
+        # These must land after the sm_scale multiply and before the mask, and SDPA
+        # rejects an additive attn_mask together with is_causal, so defer to the
+        # explicit chunked path (identical result when Sq == Skv).
+        return pytorch_ref_attention_qkv_diff(q, k, v, causal=causal, bias=bias, alibi_slopes=alibi_slopes, sink=sink)
     q_t = q.transpose(1, 2).float()
     k_t = k.transpose(1, 2).float()
     v_t = v.transpose(1, 2).float()
@@ -229,13 +375,7 @@ def pytorch_ref_attention_chunked(q_t, k_t, v_t, causal=True):
 
 
 @torch.no_grad()
-def pytorch_ref_attention_qkv_diff(q, k, v, causal=True):
-    """Reference for seqlen_q != seqlen_kv with a BOTTOM-RIGHT aligned causal mask.
-
-    q: [B,Sq,H,D]; k,v: [B,Skv,Hkv,D]. Row r keeps keys [0, r+delta] with
-    delta = Skv - Sq (so the mask hugs the bottom-right corner); an all-masked
-    row outputs 0. Chunked over Q to bound the score matrix memory.
-    """
+def pytorch_ref_attention_qkv_diff(q, k, v, causal=True, bias=None, alibi_slopes=None, sink=None):
     q_t = q.transpose(1, 2).float()
     k_t = k.transpose(1, 2).float()
     v_t = v.transpose(1, 2).float()
@@ -247,20 +387,29 @@ def pytorch_ref_attention_qkv_diff(q, k, v, causal=True):
         v_t = v_t.repeat_interleave(rep, dim=1)
     B, H, Sq, D = q_t.shape
     Skv = k_t.shape[2]
+    Dv = v_t.shape[3]
     delta = Skv - Sq
     scale = 1.0 / math.sqrt(D)
     k_trans = k_t.transpose(-1, -2).contiguous()
-    out = torch.empty((B, H, Sq, D), device=q_t.device, dtype=torch.float32)
+    out = torch.empty((B, H, Sq, Dv), device=q_t.device, dtype=torch.float32)
     chunk = max(1, min(Sq, (64 * 1024 * 1024) // max(B * H * Skv, 1)))
     key_idx = torch.arange(Skv, device=q_t.device).view(1, 1, 1, Skv)
     for s0 in range(0, Sq, chunk):
         s1 = min(s0 + chunk, Sq)
         scores = torch.matmul(q_t[:, :, s0:s1, :], k_trans) * scale
+        if alibi_slopes is not None:
+            scores = scores + _alibi_term(alibi_slopes, s0, s1, delta, key_idx)
+        if bias is not None:
+            scores = scores + bias[s0:s1].float()
         if causal:
             q_idx = torch.arange(s0, s1, device=q_t.device).view(1, 1, -1, 1)
             scores = scores.masked_fill(key_idx > q_idx + delta, float("-inf"))
-        probs = torch.softmax(scores, dim=-1)
-        probs = torch.nan_to_num(probs, nan=0.0)  # all-masked row -> 0 output
+        if sink is not None:
+            # The sink also fixes the all-masked row: it becomes all-sink, probs 0.
+            probs = _sink_softmax(scores, sink)
+        else:
+            probs = torch.softmax(scores, dim=-1)
+            probs = torch.nan_to_num(probs, nan=0.0)  # all-masked row -> 0 output
         out[:, :, s0:s1, :] = torch.matmul(probs, v_t)
     return out.transpose(1, 2)
 
@@ -269,8 +418,14 @@ def _ceil_div(a, b):
     return (a + b - 1) // b
 
 
+def bias_fits(rows, cols, elem_size=2):
+    """Skip predicate mirroring the kernel's own bias addressing limits."""
+    why = bias_addressing_error(rows * cols, elem_size)
+    return why is None, why or ""
+
+
 def _block_table_from_indices(kv_indptr_cpu, kv_indices_cpu, batch_size, max_num_pages_per_seq):
-    block_table_cpu = torch.zeros((batch_size, max_num_pages_per_seq), dtype=torch.int32)
+    block_table_cpu = torch.zeros((batch_size, max_num_pages_per_seq), dtype=torch.int32, device="cpu")
     for b in range(batch_size):
         start = kv_indptr_cpu[b].item()
         end = kv_indptr_cpu[b + 1].item()
@@ -356,8 +511,10 @@ def _build_paged_kv_for_test(
 
     kv_lens_cpu = torch.tensor(kv_lens, dtype=torch.int32, device="cpu")
     kv_num_used_pages = torch.div(kv_lens_cpu + page_size - 1, page_size, rounding_mode="floor").int()
-    kv_indptr_cpu = torch.cumsum(torch.cat((torch.tensor([0], dtype=torch.int32), kv_num_used_pages)), dim=0).int()
-    kv_indices_cpu = torch.nn.functional.pad(torch.randperm(total_num_pages).int(), (0, 128), value=0)
+    kv_indptr_cpu = torch.cumsum(
+        torch.cat((torch.tensor([0], dtype=torch.int32, device="cpu"), kv_num_used_pages)), dim=0
+    ).int()
+    kv_indices_cpu = torch.nn.functional.pad(torch.randperm(total_num_pages, device="cpu").int(), (0, 128), value=0)
     kv_last_page_len_cpu = ((kv_lens_cpu - 1) % page_size + 1).int()
     block_table_cpu = _block_table_from_indices(
         kv_indptr_cpu,
@@ -451,7 +608,7 @@ def _build_paged_kv_from_logical_for_aiter(inputs, page_size=16):
     v_cache_4d = torch.zeros_like(k_cache_4d)
     kv_num_used_pages = []
     kv_indices = []
-    block_table_cpu = torch.zeros((batch_size, max_num_pages_per_seq), dtype=torch.int32)
+    block_table_cpu = torch.zeros((batch_size, max_num_pages_per_seq), dtype=torch.int32, device="cpu")
 
     for b, kv_len in enumerate(kv_lens):
         num_pages = _ceil_div(kv_len, page_size)
@@ -460,6 +617,7 @@ def _build_paged_kv_from_logical_for_aiter(inputs, page_size=16):
             b * max_num_pages_per_seq,
             b * max_num_pages_per_seq + num_pages,
             dtype=torch.int32,
+            device="cpu",
         )
         kv_indices.extend(page_ids.tolist())
         block_table_cpu[b, :num_pages] = page_ids
@@ -491,10 +649,14 @@ def _build_paged_kv_from_logical_for_aiter(inputs, page_size=16):
     else:
         k_cache, v_cache = k_cache_4d, v_cache_4d
 
-    kv_num_used_pages_cpu = torch.tensor(kv_num_used_pages, dtype=torch.int32)
-    kv_indptr_cpu = torch.cumsum(torch.cat((torch.tensor([0], dtype=torch.int32), kv_num_used_pages_cpu)), dim=0)
-    kv_indices_cpu = torch.nn.functional.pad(torch.tensor(kv_indices, dtype=torch.int32), (0, 128), value=0)
-    kv_lens_cpu = torch.tensor(kv_lens, dtype=torch.int32)
+    kv_num_used_pages_cpu = torch.tensor(kv_num_used_pages, dtype=torch.int32, device="cpu")
+    kv_indptr_cpu = torch.cumsum(
+        torch.cat((torch.tensor([0], dtype=torch.int32, device="cpu"), kv_num_used_pages_cpu)), dim=0
+    )
+    kv_indices_cpu = torch.nn.functional.pad(
+        torch.tensor(kv_indices, dtype=torch.int32, device="cpu"), (0, 128), value=0
+    )
+    kv_lens_cpu = torch.tensor(kv_lens, dtype=torch.int32, device="cpu")
     kv_last_page_len_cpu = ((kv_lens_cpu - 1) % page_size + 1).int()
     return {
         "k_cache": k_cache,
@@ -527,6 +689,12 @@ def _build_attn_inputs_for_config(
     page_size,
     kv_cache_layout,
     trigger_lazy_else,
+    use_bias=False,
+    use_alibi=False,
+    alibi_two_d=False,
+    use_sink=False,
+    sink_share=DEFAULT_SINK_SHARE,
+    causal=False,
 ):
     device = "cuda"
     H, D, H_KV = num_heads, head_dim, num_kv_heads
@@ -562,8 +730,38 @@ def _build_attn_inputs_for_config(
             kv_cache = None
             k_t = torch.empty(total_kv, H_KV, D, dtype=dtype, device=device).uniform_(*UNIFORM_RANGE)
             v_t = torch.empty(total_kv, H_KV, D, dtype=dtype, device=device).uniform_(*UNIFORM_RANGE)
+        # Packed bias: row = global packed q token, column = per-batch-local key.
+        # Drawn after Q/K/V so those stay bit-identical to a no-bias run.
+        bias = (
+            torch.empty(total_q, max(vl_kv), dtype=dtype, device=device).uniform_(*UNIFORM_RANGE) if use_bias else None
+        )
+        alibi_slopes = make_alibi_slopes(B, H, alibi_two_d, device) if use_alibi else None
+        sink = None
+        if use_sink:
+            # One [H] table shared by every sequence, so calibrate over all their
+            # rows together -- matching how the kernel consumes it.
+            tot_lse = torch.zeros(H, dtype=torch.float32, device=device)
+            tot_n = 0
+            for b in range(B):
+                sl, n = _rows_logsumexp(
+                    q_t[cuq[b] : cuq[b + 1]].unsqueeze(0),
+                    k_t[cukv[b] : cukv[b + 1]].unsqueeze(0),
+                    causal,
+                    bias=bias[cuq[b] : cuq[b + 1], : vl_kv[b]] if bias is not None else None,
+                    alibi_slopes=(
+                        (alibi_slopes[b] if alibi_slopes.dim() == 2 else alibi_slopes)
+                        if alibi_slopes is not None
+                        else None
+                    ),
+                )
+                tot_lse += sl
+                tot_n += n
+            sink = calibrate_sink(tot_lse, tot_n, sink_share)
         return {
             "varlen": True,
+            "sink": sink,
+            "bias": bias,
+            "alibi_slopes": alibi_slopes,
             "B": B,
             "Sq": Sq,
             "Skv": None,
@@ -604,6 +802,16 @@ def _build_attn_inputs_for_config(
         k_t = torch.empty(B, Skv, H_KV, D, dtype=dtype, device=device).uniform_(*UNIFORM_RANGE)
         v_t = torch.empty(B, Skv, H_KV, D, dtype=dtype, device=device).uniform_(*UNIFORM_RANGE)
 
+    # Dense bias: (Sq, Skv), broadcast over batch and head. Drawn after Q/K/V so
+    # those stay bit-identical to a no-bias run.
+    bias = torch.empty(Sq, Skv, dtype=dtype, device=device).uniform_(*UNIFORM_RANGE) if use_bias else None
+    alibi_slopes = make_alibi_slopes(B, H, alibi_two_d, device) if use_alibi else None
+    sink = (
+        calibrate_sink(*_rows_logsumexp(q_t, k_t, causal, bias=bias, alibi_slopes=alibi_slopes), sink_share)
+        if use_sink
+        else None
+    )
+
     if trigger_lazy_else:
         q_t.fill_(1.0)
         k_t.zero_()
@@ -616,6 +824,9 @@ def _build_attn_inputs_for_config(
 
     return {
         "varlen": False,
+        "sink": sink,
+        "bias": bias,
+        "alibi_slopes": alibi_slopes,
         "B": B,
         "Sq": Sq,
         "Skv": Skv,
@@ -639,6 +850,9 @@ def _build_attn_inputs_for_config(
 def _compute_reference_from_inputs(inputs, num_heads, head_dim, dtype, causal, seqlen_q, seqlen_kv):
     H, D = num_heads, head_dim
     q_t, k_t, v_t = inputs["q_t"], inputs["k_t"], inputs["v_t"]
+    bias = inputs["bias"]
+    alibi = inputs["alibi_slopes"]
+    sink = inputs["sink"]
 
     if inputs["varlen"]:
         ref_t = torch.empty(inputs["total_q"], H, D, dtype=dtype, device=q_t.device)
@@ -648,20 +862,25 @@ def _compute_reference_from_inputs(inputs, num_heads, head_dim, dtype, causal, s
             qb = q_t[cuq[b] : cuq[b + 1]].unsqueeze(0).float()
             kb = k_t[cukv[b] : cukv[b + 1]].unsqueeze(0).float()
             vb = v_t[cukv[b] : cukv[b + 1]].unsqueeze(0).float()
+            bias_b = bias[cuq[b] : cuq[b + 1], : vl_kv[b]] if bias is not None else None
+            alibi_b = (alibi[b] if alibi.dim() == 2 else alibi) if alibi is not None else None
             ref_fn = pytorch_ref_attention if vl_q[b] == vl_kv[b] else pytorch_ref_attention_qkv_diff
-            ref_t[cuq[b] : cuq[b + 1]] = ref_fn(qb, kb, vb, causal=causal).to(dtype).squeeze(0)
+            ref_t[cuq[b] : cuq[b + 1]] = (
+                ref_fn(qb, kb, vb, causal=causal, bias=bias_b, alibi_slopes=alibi_b, sink=sink).to(dtype).squeeze(0)
+            )
         return ref_t
 
     self_attn = seqlen_kv is None or seqlen_kv == seqlen_q
-    if self_attn:
-        return pytorch_ref_attention(q_t.float(), k_t.float(), v_t.float(), causal=causal).to(dtype)
-    return pytorch_ref_attention_qkv_diff(q_t.float(), k_t.float(), v_t.float(), causal=causal).to(dtype)
+    ref_fn = pytorch_ref_attention if self_attn else pytorch_ref_attention_qkv_diff
+    return ref_fn(q_t.float(), k_t.float(), v_t.float(), causal=causal, bias=bias, alibi_slopes=alibi, sink=sink).to(
+        dtype
+    )
 
 
 def _build_inputs_and_reference_for_config(**kwargs):
     setup_seed(kwargs.pop("seed"))
     causal = kwargs.pop("causal")
-    inputs = _build_attn_inputs_for_config(**kwargs)
+    inputs = _build_attn_inputs_for_config(causal=causal, **kwargs)
     ref_t = _compute_reference_from_inputs(
         inputs,
         kwargs["num_heads"],
@@ -690,6 +909,7 @@ def _precompute_paged_kv_inputs_and_ref(
     page_size,
     kv_cache_layout,
     trigger_lazy_else=False,
+    use_bias=False,
 ):
     invalid_layout = _validate_kv_cache_layout(kv_cache_layout, page_size, head_dim, dtype)
     if invalid_layout is not None:
@@ -711,7 +931,11 @@ def _precompute_paged_kv_inputs_and_ref(
         page_size=page_size,
         kv_cache_layout=kv_cache_layout,
         trigger_lazy_else=trigger_lazy_else,
+        use_bias=use_bias,
     )
+    # ref_t folds in inputs["bias"]; a None here would compare the biased kernel
+    # run against an unbiased reference and report a meaningless PASS.
+    assert not use_bias or inputs["bias"] is not None, "use_bias=True produced no paged bias tensor"
     return inputs, ref_t, None
 
 
@@ -871,6 +1095,11 @@ def run_attn_config(
     use_block_table=False,
     page_size=64,
     kv_cache_layout="linear",
+    use_bias=False,
+    use_alibi=False,
+    alibi_two_d=False,
+    use_sink=False,
+    sink_share=DEFAULT_SINK_SHARE,
 ):
     """Unified flash-attention test/bench function.
 
@@ -914,6 +1143,32 @@ def run_attn_config(
     if splitk:
         if D not in (64, 128) or dtype_str not in ("bf16", "f16") or (seqlen_q is not None and seqlen_q < 384):
             return {"skip": True}
+        if not use_block_table and seqlen_kv is not None and seqlen_kv != seqlen_q:
+            return {
+                "skip": True,
+                "skip_reason": f"dense split-K requires seqlen_kv == seqlen_q, got {seqlen_kv} != {seqlen_q}",
+            }
+
+    # ── bias addressing guard ────────────────────────────────────────────────
+    if use_bias:
+        if varlen:
+            vl_q_cfg = list(varlen_seqlens_q)
+            vl_kv_cfg = list(varlen_seqlens_kv) if varlen_seqlens_kv is not None else vl_q_cfg
+            bias_rows, bias_cols = sum(vl_q_cfg), max(vl_kv_cfg)
+            if max(vl_q_cfg) > vl_q_cfg[-1]:
+                return {
+                    "skip": True,
+                    "skip_reason": (
+                        f"varlen bias reads OOB when the last seqlen ({vl_q_cfg[-1]}) "
+                        f"is below max_seqlen_q ({max(vl_q_cfg)})"
+                    ),
+                }
+        else:
+            bias_rows = seqlen_q
+            bias_cols = seqlen_kv if seqlen_kv is not None else seqlen_q
+        fits, why = bias_fits(bias_rows, bias_cols, torch.empty((), dtype=dtype).element_size())
+        if not fits:
+            return {"skip": True, "skip_reason": why}
 
     if use_block_table and (precomputed_inputs is None or precomputed_ref is None):
         return {"err": "block-table tests require precomputed_inputs and precomputed_ref"}
@@ -934,6 +1189,12 @@ def run_attn_config(
             page_size=page_size,
             kv_cache_layout=kv_cache_layout,
             trigger_lazy_else=trigger_lazy_else,
+            use_bias=use_bias,
+            use_alibi=use_alibi,
+            alibi_two_d=alibi_two_d,
+            use_sink=use_sink,
+            sink_share=sink_share,
+            causal=causal,
         )
 
     varlen = precomputed_inputs["varlen"]
@@ -942,9 +1203,6 @@ def run_attn_config(
     Skv = precomputed_inputs["Skv"]
     vl_q = precomputed_inputs["vl_q"]
     vl_kv = precomputed_inputs["vl_kv"]
-    cuq = precomputed_inputs["cuq"]
-    cukv = precomputed_inputs["cukv"]
-    total_q = precomputed_inputs["total_q"]
     cu_q_t = precomputed_inputs["cu_q_t"]
     cu_kv_t = precomputed_inputs["cu_kv_t"]
     q_t = precomputed_inputs["q_t"]
@@ -953,6 +1211,13 @@ def run_attn_config(
     cross = precomputed_inputs["cross"]
     max_seqlen_kv = precomputed_inputs["max_seqlen_kv"]
     kv_cache = precomputed_inputs["kv_cache"]
+    bias_t = precomputed_inputs["bias"]
+    alibi_t = precomputed_inputs["alibi_slopes"]
+    sink_t = precomputed_inputs["sink"]
+    # ref_t is built from these same inputs, so a missing bias makes both sides
+    # unbiased and the comparison vacuous. Fail loudly instead.
+    if use_bias and bias_t is None:
+        return {"err": "use_bias=True but the precomputed inputs carry no bias"}
 
     debug_counts = torch.zeros(2, dtype=torch.float32, device=device) if debug_lazy else None
     o_t = torch.zeros_like(q_t)
@@ -977,6 +1242,7 @@ def run_attn_config(
                 kv_cache_layout=kv_cache_layout,
                 num_kv_splits=int(num_kv_splits),
                 out=o_t,
+                bias=bias_t,
                 **_paged_varlen_kw,
                 **_cfg_kw(),
             )
@@ -993,6 +1259,9 @@ def run_attn_config(
                 max_seqlen_kv=max_seqlen_kv if varlen else None,
                 cross_seqlen=cross if varlen else None,
                 num_kv_splits=int(num_kv_splits),
+                bias=bias_t,
+                alibi_slopes=alibi_t,
+                sink=sink_t,
                 out=o_t,
                 debug_counts=debug_counts,
                 **_cfg_kw(),
@@ -1017,21 +1286,12 @@ def run_attn_config(
     # ── reference ───────────────────────────────────────────────────────────
     # precomputed_ref makes FlyDSL/aiter_ck/aiter_asm share one reference tensor.
     # Otherwise compute the cheapest reference path for the active mode.
-    _self_attn = not varlen and (seqlen_kv is None or seqlen_kv == seqlen_q)
+    # Delegated rather than inlined so the bias enters the reference in exactly one
+    # place; two copies of this dispatch would be free to drift apart.
     if precomputed_ref is not None:
         ref_t = precomputed_ref
-    elif varlen:
-        ref_t = torch.empty(total_q, H, D, dtype=dtype, device=device)
-        for b in range(B):
-            qb = q_t[cuq[b] : cuq[b + 1]].unsqueeze(0).float()
-            kb = k_t[cukv[b] : cukv[b + 1]].unsqueeze(0).float()
-            vb = v_t[cukv[b] : cukv[b + 1]].unsqueeze(0).float()
-            ref_fn = pytorch_ref_attention if vl_q[b] == vl_kv[b] else pytorch_ref_attention_qkv_diff
-            ref_t[cuq[b] : cuq[b + 1]] = ref_fn(qb, kb, vb, causal=causal).to(dtype).squeeze(0)
-    elif _self_attn:
-        ref_t = pytorch_ref_attention(q_t.float(), k_t.float(), v_t.float(), causal=causal).to(dtype)
     else:
-        ref_t = pytorch_ref_attention_qkv_diff(q_t.float(), k_t.float(), v_t.float(), causal=causal).to(dtype)
+        ref_t = _compute_reference_from_inputs(precomputed_inputs, H, D, dtype, causal, seqlen_q, seqlen_kv)
 
     o_f32 = o_t.contiguous().reshape(-1).float()
     ref_f32 = ref_t.contiguous().reshape(-1).float()
@@ -1099,6 +1359,7 @@ def run_attn_config(
                     kv_cache_layout=kv_cache_layout,
                     num_kv_splits=int(num_kv_splits),
                     out=o_t,
+                    bias=bias_t,
                     **_paged_varlen_kw,
                     **_cfg_kw(),
                 )
@@ -1115,6 +1376,9 @@ def run_attn_config(
                     max_seqlen_kv=max_seqlen_kv if varlen else None,
                     cross_seqlen=cross if varlen else None,
                     num_kv_splits=int(num_kv_splits),
+                    bias=bias_t,
+                    alibi_slopes=alibi_t,
+                    sink=sink_t,
                     out=o_t,
                     debug_counts=debug_counts,
                     **_cfg_kw(),
@@ -1156,6 +1420,9 @@ def run_aiter_bench(
     seqlen_kv=None,
     varlen_seqlens_q=None,
     varlen_seqlens_kv=None,
+    use_bias=False,
+    use_alibi=False,
+    use_sink=False,
 ):
     """Run true aiter_ck or true aiter_asm kernel via aiter and return {tflops, max_err, us}."""
     try:
@@ -1169,6 +1436,15 @@ def run_aiter_bench(
     if backend == "asm" and head_dim != 128:
         return {"skip": True}
     if backend == "asm" and (varlen or (seqlen_kv is not None and seqlen_kv != seq_len)):
+        return {"skip": True}
+    bias = precomputed_inputs["bias"] if precomputed_inputs is not None else None
+    if use_bias and (backend == "asm" or varlen or bias is None):
+        return {"skip": True}
+    alibi = precomputed_inputs["alibi_slopes"] if precomputed_inputs is not None else None
+    if use_alibi and (backend == "asm" or causal or use_bias or alibi is None):
+        return {"skip": True}
+    sink = precomputed_inputs["sink"] if precomputed_inputs is not None else None
+    if use_sink and (backend == "asm" or varlen or sink is None):
         return {"skip": True}
 
     results = {}
@@ -1248,14 +1524,15 @@ def run_aiter_bench(
                 causal,  # is_causal
                 -1,  # window_size_left
                 -1,  # window_size_right
-                0,  # sink_size
+                1 if use_sink else 0,  # sink_size
                 True,  # return_softmax_lse
                 False,  # return_dropout_randval
+                sink_ptr=sink if use_sink else None,
                 cu_seqlens_q=cu_q_t,
                 cu_seqlens_kv=cu_kv_t,
                 out=None,
-                bias=None,
-                alibi_slopes=None,
+                bias=bias,
+                alibi_slopes=alibi,
                 q_descale=None,
                 k_descale=None,
                 v_descale=None,
@@ -1387,6 +1664,26 @@ def _dequant_fp8(x_fp8, descale):
     return x_fp8.to(torch.float32) * descale.to(torch.float32)
 
 
+def _score_pairs(sq, skv, causal):
+    """(q, k) score elements actually computed for one sequence pair.
+
+    Non-causal is the full sq*skv rectangle. Causal is bottom-right aligned like
+    the kernel mask (row i attends keys [0, skv - sq + i]), so a cross-length pair
+    keeps the whole prefix. Matches sq*skv/2 when sq == skv, which is what the
+    self-attention TFLOPS numbers have always used.
+    """
+    if not causal:
+        return float(sq * skv)
+    if sq <= skv:
+        return 0.5 * sq * (2 * skv - sq)
+    return 0.5 * skv * skv
+
+
+def _fp8_flops(pairs, num_heads, head_dim, head_dim_v):
+    """FLOPs for `pairs` score elements: 2*pairs*D for QK^T plus 2*pairs*Dv for PV."""
+    return 2.0 * pairs * num_heads * (head_dim + head_dim_v)
+
+
 def run_fp8_config(
     batch,
     seq_len,
@@ -1398,31 +1695,37 @@ def run_fp8_config(
     seed=DEFAULT_SEED,
     verbose=True,
     num_kv_heads=None,
-    num_kv_splits=1,
+    num_kv_splits=None,
+    head_dim_v=None,
+    seqlen_kv=None,
+    varlen_seqlens_q=None,
+    varlen_seqlens_kv=None,
+    bench=True,
 ):
     """Run the FlyDSL fp8 (e4m3fn) forward path and validate vs a dequantized-input
     SDPA reference at the fixed fp8 gate (max_err < 5e-2 and min_cos > 0.98).
 
-    Unsupported fp8 configurations (non-gfx950, head_dim != 128, split-K) raise a
-    clear error that is surfaced as an ERROR row (never a silent SKIP). Returns a
-    run_config-compatible dict so it prints through the same summary table.
+    Shape options beyond dense self-attention:
+      - ``head_dim_v``: V (and therefore O) head dim, when it differs from the QK
+        ``head_dim`` -- e.g. QK D=192 with V Dv=128.
+      - ``seqlen_kv``: dense cross-attention, K/V longer or shorter than Q.
+      - ``varlen_seqlens_q`` / ``varlen_seqlens_kv``: packed varlen. Q is
+        ``[total_q, H, D]``, K/V are ``[total_kv, Hkv, *]`` and cu_seqlens are
+        derived from the per-sequence lengths. Passing only ``varlen_seqlens_q``
+        makes it self-attention.
+      - ``num_kv_splits``: ``None`` autotunes, ``1`` pins the unsplit kernel,
+        ``> 1`` forces that many KV splits.
+
+    Returns a run_config-compatible dict so it prints through the same summary
+    table. ``bench=False`` skips the timing pass and returns correctness only.
     """
     device = "cuda"
     results = {}
 
     if num_kv_heads is None:
         num_kv_heads = num_heads
+    Dv = head_dim if head_dim_v is None else head_dim_v
 
-    # fp8 split-K is not implemented. Reject it explicitly rather than silently
-    # running a dense fp8 forward while the config row advertises kv_sp>1 (which
-    # would validate the wrong path).
-    if int(num_kv_splits) > 1:
-        results["err"] = f"fp8 split-K (num_kv_splits={num_kv_splits}) is not implemented (dense fp8 only)"
-        return results
-
-    # fp8 forward is gfx950-only and head_dim==128 only. Reject anything else
-    # up-front with a clear, specific error (surfaced as an ERROR row) rather
-    # than a SKIP that would mask a real failure.
     try:
         gpu_arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
     except Exception:
@@ -1430,30 +1733,79 @@ def run_fp8_config(
     if not gpu_arch.startswith("gfx950"):
         results["err"] = f"fp8 requires gfx950 (got '{gpu_arch or 'unknown'}')"
         return results
-    if head_dim != 128:
-        results["err"] = f"fp8 requires head_dim == 128 (got {head_dim})"
-        return results
     if num_heads % num_kv_heads != 0:
         results["err"] = f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
         return results
-    if seq_len < 1:
-        results["err"] = f"seq_len ({seq_len}) must be >= 1"
-        return results
 
-    B, S, H, D = batch, seq_len, num_heads, head_dim
+    varlen = varlen_seqlens_q is not None
+    if varlen:
+        vl_q = list(varlen_seqlens_q)
+        vl_kv = list(varlen_seqlens_kv) if varlen_seqlens_kv is not None else list(vl_q)
+        if len(vl_kv) != len(vl_q):
+            results["err"] = f"varlen_seqlens_kv ({len(vl_kv)}) must match varlen_seqlens_q ({len(vl_q)})"
+            return results
+        if min(vl_q + vl_kv) < 1:
+            results["err"] = f"varlen seqlens must be >= 1, got q={vl_q} kv={vl_kv}"
+            return results
+    else:
+        if seq_len < 1:
+            results["err"] = f"seq_len ({seq_len}) must be >= 1"
+            return results
+        if seqlen_kv is not None and seqlen_kv < 1:
+            results["err"] = f"seqlen_kv ({seqlen_kv}) must be >= 1"
+            return results
+        vl_q = vl_kv = None
+
+    H, D = num_heads, head_dim
     H_KV = num_kv_heads
     setup_seed(seed)
 
     # Host bf16 master tensors -> per-tensor e4m3fn + shape-[1] fp32 descales.
-    q_bf16 = torch.empty(B, S, H, D, dtype=torch.bfloat16, device=device).uniform_(*UNIFORM_RANGE)
-    k_bf16 = torch.empty(B, S, H_KV, D, dtype=torch.bfloat16, device=device).uniform_(*UNIFORM_RANGE)
-    v_bf16 = torch.empty(B, S, H_KV, D, dtype=torch.bfloat16, device=device).uniform_(*UNIFORM_RANGE)
+    if varlen:
+        B = len(vl_q)
+        cuq = [0]
+        for s in vl_q:
+            cuq.append(cuq[-1] + s)
+        cukv = [0]
+        for s in vl_kv:
+            cukv.append(cukv[-1] + s)
+        total_q, total_kv = cuq[-1], cukv[-1]
+        cross = any(a != b for a, b in zip(vl_q, vl_kv))
+        cu_q_t = torch.tensor(cuq, dtype=torch.int32, device=device)
+        cu_kv_t = torch.tensor(cukv, dtype=torch.int32, device=device)
+        q_bf16 = torch.empty(total_q, H, D, dtype=torch.bfloat16, device=device).uniform_(*UNIFORM_RANGE)
+        k_bf16 = torch.empty(total_kv, H_KV, D, dtype=torch.bfloat16, device=device).uniform_(*UNIFORM_RANGE)
+        v_bf16 = torch.empty(total_kv, H_KV, Dv, dtype=torch.bfloat16, device=device).uniform_(*UNIFORM_RANGE)
+        o_shape = (total_q, H, Dv)
+        S, Skv = max(vl_q), max(vl_kv)
+        pairs = sum(_score_pairs(a, b, causal) for a, b in zip(vl_q, vl_kv))
+    else:
+        B, S = batch, seq_len
+        Skv = seq_len if seqlen_kv is None else seqlen_kv
+        cross = Skv != S
+        cu_q_t = cu_kv_t = None
+        q_bf16 = torch.empty(B, S, H, D, dtype=torch.bfloat16, device=device).uniform_(*UNIFORM_RANGE)
+        k_bf16 = torch.empty(B, Skv, H_KV, D, dtype=torch.bfloat16, device=device).uniform_(*UNIFORM_RANGE)
+        v_bf16 = torch.empty(B, Skv, H_KV, Dv, dtype=torch.bfloat16, device=device).uniform_(*UNIFORM_RANGE)
+        o_shape = (B, S, H, Dv)
+        pairs = B * _score_pairs(S, Skv, causal)
+
     q_fp8, q_descale = quantize_per_tensor_fp8(q_bf16)
     k_fp8, k_descale = quantize_per_tensor_fp8(k_bf16)
     v_fp8, v_descale = quantize_per_tensor_fp8(v_bf16)
 
-    o_bf16 = torch.zeros(B, S, H, D, dtype=torch.bfloat16, device=device)
+    o_bf16 = torch.zeros(*o_shape, dtype=torch.bfloat16, device=device)
     fp8_exec_kwargs = dict(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
+    if varlen:
+        fp8_exec_kwargs.update(
+            cu_seqlens_q=cu_q_t,
+            cu_seqlens_kv=cu_kv_t,
+            max_seqlen_q=S,
+            cross_seqlen=cross,
+        )
+        if cross:
+            fp8_exec_kwargs["max_seqlen_kv"] = Skv
+    fp8_exec_kwargs["num_kv_splits"] = None if num_kv_splits is None else int(num_kv_splits)
 
     try:
         flydsl_flash_attn_func(
@@ -1478,20 +1830,30 @@ def run_fp8_config(
     o_flat = o_bf16.contiguous().view(-1)
 
     # Reference: dequantize the SAME e4m3fn Q/K/V (applying descales) and run the
-    # high-precision SDPA reference the bf16 path uses.
-    ref_4d = pytorch_ref_attention(
-        _dequant_fp8(q_fp8, q_descale),
-        _dequant_fp8(k_fp8, k_descale),
-        _dequant_fp8(v_fp8, v_descale),
-        causal=causal,
-    )
-    ref_flat = ref_4d.to(torch.float32).contiguous().view(-1)
+    q_ref = _dequant_fp8(q_fp8, q_descale)
+    k_ref = _dequant_fp8(k_fp8, k_descale)
+    v_ref = _dequant_fp8(v_fp8, v_descale)
+    if varlen:
+        ref_t = torch.empty(o_shape, dtype=torch.float32, device=device)
+        for b in range(B):
+            ref_fn = pytorch_ref_attention if (vl_q[b] == vl_kv[b] and D == Dv) else pytorch_ref_attention_qkv_diff
+            ref_t[cuq[b] : cuq[b + 1]] = ref_fn(
+                q_ref[cuq[b] : cuq[b + 1]].unsqueeze(0),
+                k_ref[cukv[b] : cukv[b + 1]].unsqueeze(0),
+                v_ref[cukv[b] : cukv[b + 1]].unsqueeze(0),
+                causal=causal,
+            ).squeeze(0)
+        ref_out = ref_t
+    else:
+        ref_fn = pytorch_ref_attention if (not cross and D == Dv) else pytorch_ref_attention_qkv_diff
+        ref_out = ref_fn(q_ref, k_ref, v_ref, causal=causal)
+    ref_flat = ref_out.to(torch.float32).contiguous().view(-1)
 
     o_f32 = o_flat.float()
     ref_f32 = ref_flat.float()
     max_err = (o_f32 - ref_f32).abs().max().item()
     mean_err = (o_f32 - ref_f32).abs().mean().item()
-    cos_sim = F.cosine_similarity(o_f32.reshape(-1, D), ref_f32.reshape(-1, D), dim=1)
+    cos_sim = F.cosine_similarity(o_f32.reshape(-1, Dv), ref_f32.reshape(-1, Dv), dim=1)
     min_cos = cos_sim.min().item()
     results["max_err"] = max_err
     results["mean_err"] = mean_err
@@ -1499,12 +1861,16 @@ def run_fp8_config(
     results["passed"] = max_err < FP8_MAX_ERR and min_cos > FP8_MIN_COS
 
     if verbose:
-        tag = f"B={B} S={S} H={H} D={D} fp8"
-        print(f"  [{tag}] --- compare_arrays ---")
+        shape_tag = f"varlen q={vl_q} kv={vl_kv}" if varlen else f"B={B} S={S} Skv={Skv}"
+        d_tag = f"D={D}" if D == Dv else f"D={D} Dv={Dv}"
+        print(f"  [{shape_tag} H={H} {d_tag} kv_sp={num_kv_splits} fp8] --- compare_arrays ---")
         compare_arrays(
             o_f32.detach().cpu().numpy(),
             ref_f32.detach().cpu().numpy(),
         )
+
+    if not bench:
+        return results
 
     try:
 
@@ -1537,10 +1903,8 @@ def run_fp8_config(
             torch.cuda.synchronize()
 
         _, us = run_perftest(kernel_fn, num_iters=iters, num_warmup=warmup)
-        s_eff = S / 2.0 if causal else float(S)
-        flops = 4.0 * S * s_eff * D * H * B
         results["us"] = us
-        results["tflops"] = flops / (us * 1e-6) / 1e12
+        results["tflops"] = _fp8_flops(pairs, H, D, Dv) / (us * 1e-6) / 1e12
     except Exception as e:
         # A failed timing path must not be reportable as a clean PASS-with-N/A row.
         # Keep the correctness numbers visible but mark the row not-passed so the
@@ -2277,13 +2641,13 @@ def _fmt_normal_row(cfg, path, status, r):
 
 
 _EXTRA_HDR = (
-    f"  {'Sq':<24} {'Skv':<24} {'H':>4} {'Hkv':>4} {'D':>4} " f"{'dtype':>6} {'causal':>8} {'Path':<{_PATH_W}s}"
+    f"  {'Sq':<24} {'Skv':<24} {'H':>4} {'Hkv':>4} {'D':>7} " f"{'dtype':>6} {'causal':>8} {'Path':<{_PATH_W}s}"
 )
 _EXTRA_W = len(_EXTRA_HDR)
 
 
 def _fmt_extra_prefix(sq, skv, nh, nh_kv, hd, dtype_key, causal_tag, path=""):
-    return f"  {sq:<24} {skv:<24} {nh:>4} {nh_kv:>4} {hd:>4} " f"{dtype_key:>6} {causal_tag:>8} {path:<{_PATH_W}s}"
+    return f"  {sq:<24} {skv:<24} {nh:>4} {nh_kv:>4} {hd:>7} " f"{dtype_key:>6} {causal_tag:>8} {path:<{_PATH_W}s}"
 
 
 def _fmt_extra_cmp_row(sq, skv, nh, nh_kv, hd, dtype_key, causal_tag, path, fly_r, ck_r):
@@ -2369,6 +2733,50 @@ def main():
         help="Run additional varlen/cross-length configs from EXTRA_CONFIGS",
     )
     parser.add_argument(
+        "--bias",
+        action="store_true",
+        help="Add an additive attention bias to the scores: softmax(q@k^T * sm_scale + bias). "
+        "Dense bias is [Sq, Skv] broadcast over batch and head; varlen bias is packed "
+        "[total_q, max_seqlen_kv] with global q rows and batch-local key columns. Combines "
+        "with --block-table, where columns stay the logical (batch-local) key positions. "
+        "gfx950 bf16/f16 D=64/128 only; incompatible with fp8. Rows whose "
+        "bias exceeds the i32 offset / 4 GiB buffer limits are SKIPped.",
+    )
+    parser.add_argument(
+        "--alibi",
+        action="store_true",
+        help="Add a per-head ALiBi positional bias: score += -slope * |i + seqlen_kv - seqlen_q - j|, "
+        "applied after the 1/sqrt(D) scaling and bottom-right aligned like the causal mask. "
+        "Slopes are the canonical 2**(-8*(h+1)/H) ladder. gfx950 bf16/f16 D=64/128 only; "
+        "incompatible with --block-table and fp8. Combines with --bias.",
+    )
+    parser.add_argument(
+        "--sink",
+        action="store_true",
+        help="Add a per-head attention sink: one extra softmax denominator logit with no matching V "
+        "row, O = sum_j exp(s_j-m) v_j / (exp(sink-m) + sum_j exp(s_j-m)). The sink is calibrated per "
+        "run to --sink-share of the softmax mass; an uncalibrated sink near 0 would sit below the bf16 "
+        "noise floor and pass even if dropped. gfx950 bf16/f16 D=64/128 only; incompatible with "
+        "--block-table and fp8. Combines with --bias and --alibi. Under --compare the aiter_ck "
+        "column runs a real sink baseline (mha_fwd sink_size/sink_ptr); aiter_asm has no sink "
+        "parameter and is SKIPped, as is the varlen path.",
+    )
+    parser.add_argument(
+        "--sink-share",
+        type=float,
+        default=DEFAULT_SINK_SHARE,
+        dest="sink_share",
+        help=f"Fraction of the softmax mass the sink should take, in (0, 1). Default {DEFAULT_SINK_SHARE}. "
+        "Values in 0.25-0.95 keep the sink well above bf16 noise. Requires --sink.",
+    )
+    parser.add_argument(
+        "--alibi-2d",
+        action="store_true",
+        dest="alibi_two_d",
+        help="Use a per-(batch, head) [B, H] slope table instead of the [H] form, exercising the "
+        "kernel's alibi_stride_b path. Requires --alibi.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print per-config result_md5 / ref_md5 and bit-identical check (also enabled in --compare mode)",
@@ -2444,6 +2852,24 @@ def main():
     args = parser.parse_args()
     if not args.block_table and args.kv_cache_layout != "linear":
         parser.error("--kv-cache-layout requires --block-table")
+    # fp8 has no bias support in the kernel; reject rather than run a bias-free
+    # kernel against a biased reference. Paged KV does support bias.
+    if args.bias and args.dtype == "fp8":
+        parser.error("--bias is not supported with --dtype fp8")
+    if args.alibi and args.block_table:
+        parser.error("--alibi is not supported with --block-table (paged KV)")
+    if args.alibi and args.dtype == "fp8":
+        parser.error("--alibi is not supported with --dtype fp8")
+    if args.alibi_two_d and not args.alibi:
+        parser.error("--alibi-2d requires --alibi")
+    if args.sink and args.block_table:
+        parser.error("--sink is not supported with --block-table (paged KV)")
+    if args.sink and args.dtype == "fp8":
+        parser.error("--sink is not supported with --dtype fp8")
+    if args.sink_share != DEFAULT_SINK_SHARE and not args.sink:
+        parser.error("--sink-share requires --sink")
+    if not 0.0 < args.sink_share < 1.0:
+        parser.error(f"--sink-share must be in (0, 1), got {args.sink_share}")
 
     # Build kernel config from parsed args (no env-var reads).
     FLASH_ATTN_FUNC_KERNEL_CONFIG.update(
@@ -2482,15 +2908,28 @@ def main():
 
     causal_desc = {True: "causal", False: "non-causal", None: "causal+non-causal"}[args.causal]
     dtype_desc = args.dtype or "bf16+fp16"
+    _terms = [t for t, on in (("bias", args.bias), ("alibi", args.alibi), ("sink", args.sink)) if on]
+    bias_desc = ("; " + "+".join(_terms)) if _terms else ""
+    # Keep biased and unbiased baselines in separate CSVs so they stay diffable.
+    csv_tag = ("_" + "".join(_terms)) if _terms else ""
     extra_cases = (
         [_extra_case_from_config(row) for row in EXTRA_CONFIGS] if args.extra and configs is DEFAULT_CONFIGS else []
     )
+    fp8_extra_cases = (
+        [_extra_case_from_config(row) for row in FP8_EXTRA_CONFIGS]
+        if args.extra and configs is DEFAULT_CONFIGS and "fp8" in dtypes_to_test
+        else []
+    )
+    if args.compare and fp8_extra_cases:
+        print("  note: fp8 extra shapes (D/Dv, varlen, split-K) run in normal mode only; skipped under --compare")
+        fp8_extra_cases = []
     run_configs = [
         (batch, seq_len, nh, nh_kv_default, hd, cfg_kv_splits)
         for batch, seq_len, nh, nh_kv_default, cfg_kv_splits in configs
         for hd in head_dims_to_test
     ]
     extra_run_cases = [(case, hd) for case in extra_cases for hd in head_dims_to_test]
+    extra_run_cases += [(case, case["hd"]) for case in fp8_extra_cases]
     paged_kv_paths = [(None, "")]
     if args.block_table:
         paged_kv_paths = [
@@ -2501,7 +2940,7 @@ def main():
     if args.compare:
         # ---- Comparison mode: FlyDSL vs aiter_ck vs aiter_asm ----
         print("=" * 130)
-        print(f"FlyDSL vs aiter_ck vs aiter_asm  ({causal_desc}, {dtype_desc})")
+        print(f"FlyDSL vs aiter_ck vs aiter_asm  ({causal_desc}, {dtype_desc}{bias_desc})")
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         if args.num_kv_splits > 1:
             print(
@@ -2560,16 +2999,16 @@ def main():
                                 page_size=args.page_size,
                                 kv_cache_layout=kv_cache_layout or "linear",
                                 trigger_lazy_else=args.trigger_lazy_else,
+                                use_bias=args.bias,
                             )
                             if precompute_status is not None:
                                 rows.append((cfg, precompute_status, precompute_status, {"skip": True}))
                                 continue
                         else:
                             shared_ref = None
-                            # Compute reference once for bf16/fp16 rows (fp8 helper owns quantization + reference).
                             if dtype_str == "fp8":
                                 pass
-                            elif args.trigger_lazy_else:
+                            elif args.trigger_lazy_else or args.bias or args.alibi or args.sink:
                                 precomputed_inputs, shared_ref = _build_inputs_and_reference_for_config(
                                     batch=batch,
                                     seqlen_q=seq_len,
@@ -2585,7 +3024,12 @@ def main():
                                     use_block_table=False,
                                     page_size=args.page_size,
                                     kv_cache_layout=kv_cache_layout or "linear",
-                                    trigger_lazy_else=True,
+                                    trigger_lazy_else=args.trigger_lazy_else,
+                                    use_bias=args.bias,
+                                    use_alibi=args.alibi,
+                                    use_sink=args.sink,
+                                    sink_share=args.sink_share,
+                                    alibi_two_d=args.alibi_two_d,
                                 )
                             else:
                                 # All three use the same seed -> same Q/K/V -> identical reference.
@@ -2643,6 +3087,11 @@ def main():
                                     use_block_table=args.block_table,
                                     page_size=args.page_size,
                                     kv_cache_layout=kv_cache_layout or "linear",
+                                    use_bias=args.bias,
+                                    use_alibi=args.alibi,
+                                    use_sink=args.sink,
+                                    sink_share=args.sink_share,
+                                    alibi_two_d=args.alibi_two_d,
                                 )
                         except Exception as _fly_err:
                             print(f"    [FlyDSL unsupported] {_fmt_cfg(cfg)}: {_fly_err}", flush=True)
@@ -2700,6 +3149,9 @@ def main():
                                 num_kv_heads=nh_kv,
                                 precomputed_ref=shared_ref,
                                 precomputed_inputs=precomputed_inputs,
+                                use_bias=args.bias,
+                                use_alibi=args.alibi,
+                                use_sink=args.sink,
                             )
                             asm_r = run_aiter_bench(
                                 batch,
@@ -2715,6 +3167,9 @@ def main():
                                 num_kv_heads=nh_kv,
                                 precomputed_ref=shared_ref,
                                 precomputed_inputs=precomputed_inputs,
+                                use_bias=args.bias,
+                                use_alibi=args.alibi,
+                                use_sink=args.sink,
                             )
                         rows.append((cfg, fly_r, ck_r, asm_r))
 
@@ -2769,7 +3224,7 @@ def main():
         _print_grouped_avgs(rows, lambda r: _tag_group(r[0]), _cmp_avg)
         print("=" * len(hdr2))
 
-        csv_path = f"fmha_perf_compare_{_gpu_short_name()}.csv"
+        csv_path = f"fmha_perf_compare{csv_tag}_{_gpu_short_name()}.csv"
         _write_cmp_csv(csv_path, rows, cmp_avg_rows)
         print(f"Results saved to: {csv_path}")
 
@@ -2820,6 +3275,7 @@ def main():
                                     seed=args.seed,
                                     page_size=args.page_size,
                                     kv_cache_layout=kv_cache_layout or "linear",
+                                    use_bias=args.bias,
                                 )
                                 if precompute_status is not None:
                                     varlen_cmp_rows.append(
@@ -2856,6 +3312,11 @@ def main():
                                     use_block_table=args.block_table,
                                     page_size=args.page_size,
                                     kv_cache_layout=kv_cache_layout or "linear",
+                                    use_bias=args.bias,
+                                    use_alibi=args.alibi,
+                                    use_sink=args.sink,
+                                    sink_share=args.sink_share,
+                                    alibi_two_d=args.alibi_two_d,
                                     **kwargs,
                                 )
                             except Exception as _fly_err:
@@ -2892,6 +3353,9 @@ def main():
                                     seqlen_kv=kwargs.get("seqlen_kv"),
                                     varlen_seqlens_q=kwargs.get("varlen_seqlens_q"),
                                     varlen_seqlens_kv=kwargs.get("varlen_seqlens_kv"),
+                                    use_bias=args.bias,
+                                    use_alibi=args.alibi,
+                                    use_sink=args.sink,
                                 )
                             varlen_cmp_rows.append(
                                 (
@@ -2925,14 +3389,14 @@ def main():
 
             _print_grouped_avgs(varlen_cmp_rows, lambda r: (r[5], r[6]), _extra_cmp_avg)
             print("=" * len(xhdr2))
-            varlen_csv_path = f"fmha_varlen_perf_compare_{_gpu_short_name()}.csv"
+            varlen_csv_path = f"fmha_varlen_perf_compare{csv_tag}_{_gpu_short_name()}.csv"
             _write_varlen_cmp_csv(varlen_csv_path, varlen_cmp_rows, varlen_cmp_avg_rows)
             print(f"Varlen results saved to: {varlen_csv_path}")
 
     else:
         # ---- Normal FlyDSL test mode ----
         print("=" * 130)
-        print(f"FlyDSL flash_attn_func ({causal_desc}, {dtype_desc})")
+        print(f"FlyDSL flash_attn_func ({causal_desc}, {dtype_desc}{bias_desc})")
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"  Kernel opts: {FLASH_ATTN_FUNC_KERNEL_CONFIG}")
         if args.block_table:
@@ -2991,6 +3455,7 @@ def main():
                                         page_size=args.page_size,
                                         kv_cache_layout=kv_cache_layout or "linear",
                                         trigger_lazy_else=args.trigger_lazy_else,
+                                        use_bias=args.bias,
                                     )
                                 )
                                 if precompute_status is not None:
@@ -3021,6 +3486,11 @@ def main():
                                 precomputed_inputs=precomputed_inputs,
                                 page_size=args.page_size,
                                 kv_cache_layout=kv_cache_layout or "linear",
+                                use_bias=args.bias,
+                                use_alibi=args.alibi,
+                                use_sink=args.sink,
+                                sink_share=args.sink_share,
+                                alibi_two_d=args.alibi_two_d,
                             )
                             if "err" in r:
                                 print(f"    [FlyDSL unsupported] {_fmt_cfg(cfg)} {path}: {r['err']}", flush=True)
@@ -3070,7 +3540,7 @@ def main():
         _print_grouped_avgs(rows, lambda r: _tag_group(r[0]), _normal_avg_fn)
         print("=" * len(hdr))
 
-        csv_path = f"fmha_perf_{_gpu_short_name()}.csv"
+        csv_path = f"fmha_perf{csv_tag}_{_gpu_short_name()}.csv"
         _write_normal_csv(csv_path, rows, normal_avg_rows)
         print(f"Results saved to: {csv_path}")
 
@@ -3092,13 +3562,15 @@ def main():
                         nh_kv_eff = args.num_kv_heads if args.num_kv_heads is not None else case["nh_kv"]
                         kv_splits = case.get("kv_splits", 1)
                         kwargs = dict(case["kwargs"])
+                        hd_v = case.get("hd_v", hd)
+                        hd_label = hd if hd_v == hd else f"{hd}/{hd_v}"
                         for kv_cache_layout, path in paged_kv_paths:
                             pre = _fmt_extra_prefix(
                                 case["sq_label"],
                                 case["skv_label"],
                                 nh,
                                 nh_kv_eff,
-                                hd,
+                                hd_label,
                                 dtype_key,
                                 ctag,
                                 path=path,
@@ -3123,6 +3595,7 @@ def main():
                                             seed=args.seed,
                                             page_size=args.page_size,
                                             kv_cache_layout=kv_cache_layout or "linear",
+                                            use_bias=args.bias,
                                         )
                                     )
                                     if precompute_status is not None:
@@ -3133,7 +3606,7 @@ def main():
                                                 case["skv_label"],
                                                 nh,
                                                 nh_kv_eff,
-                                                hd,
+                                                hd_label,
                                                 dtype_key,
                                                 ctag,
                                                 path,
@@ -3160,6 +3633,10 @@ def main():
                                         verbose=False,
                                         num_kv_heads=nh_kv_eff,
                                         num_kv_splits=kv_splits,
+                                        head_dim_v=hd_v,
+                                        seqlen_kv=kwargs.get("seqlen_kv"),
+                                        varlen_seqlens_q=kwargs.get("varlen_seqlens_q"),
+                                        varlen_seqlens_kv=kwargs.get("varlen_seqlens_kv"),
                                     )
                                 else:
                                     r = run_attn_config(
@@ -3179,6 +3656,11 @@ def main():
                                         precomputed_inputs=precomputed_inputs,
                                         page_size=args.page_size,
                                         kv_cache_layout=kv_cache_layout or "linear",
+                                        use_bias=args.bias,
+                                        use_alibi=args.alibi,
+                                        use_sink=args.sink,
+                                        sink_share=args.sink_share,
+                                        alibi_two_d=args.alibi_two_d,
                                         **kwargs,
                                     )
                             except Exception as e:
@@ -3189,7 +3671,7 @@ def main():
                                         case["skv_label"],
                                         nh,
                                         nh_kv_eff,
-                                        hd,
+                                        hd_label,
                                         dtype_key,
                                         ctag,
                                         path,
@@ -3207,7 +3689,7 @@ def main():
                                         case["skv_label"],
                                         nh,
                                         nh_kv_eff,
-                                        hd,
+                                        hd_label,
                                         dtype_key,
                                         ctag,
                                         path,
@@ -3225,7 +3707,7 @@ def main():
                                         case["skv_label"],
                                         nh,
                                         nh_kv_eff,
-                                        hd,
+                                        hd_label,
                                         dtype_key,
                                         ctag,
                                         path,
@@ -3248,7 +3730,7 @@ def main():
                                     case["skv_label"],
                                     nh,
                                     nh_kv_eff,
-                                    hd,
+                                    hd_label,
                                     dtype_key,
                                     ctag,
                                     path,
@@ -3276,7 +3758,7 @@ def main():
 
             _print_grouped_avgs(varlen_rows, lambda r: (r[5], r[6]), _extra_normal_avg)
             print("=" * len(xhdr))
-            varlen_csv_path = f"fmha_varlen_perf_{_gpu_short_name()}.csv"
+            varlen_csv_path = f"fmha_varlen_perf{csv_tag}_{_gpu_short_name()}.csv"
             _write_varlen_normal_csv(varlen_csv_path, varlen_rows, varlen_avg_rows)
             print(f"Varlen results saved to: {varlen_csv_path}")
 
@@ -3428,6 +3910,531 @@ def test_lse_varlen(causal):
         _assert_lse_matches(lse[b, :, :n], ref, _ATOL_BF16)
 
 
+# ── attention bias ───────────────────────────────────────────────────────────
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("B,S,H,Hkv,D", [(1, 512, 8, 8, 128), (2, 384, 8, 4, 64)])
+def test_bias_dense(causal, B, S, H, Hkv, D):
+    """Dense bias is [Sq, Skv], broadcast over batch and head."""
+    dtype = torch.bfloat16
+    setup_seed(DEFAULT_SEED)
+    q = torch.empty(B, S, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    k = torch.empty(B, S, Hkv, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    v = torch.empty(B, S, Hkv, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    bias = torch.empty(S, S, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+
+    out = flydsl_flash_attn_func(q, k, v, causal=causal, num_kv_heads=Hkv, bias=bias)
+    torch.cuda.synchronize()
+    ref = pytorch_ref_attention(q.float(), k.float(), v.float(), causal=causal, bias=bias)
+    _, _, passed = _acc_metric(out.float().reshape(-1), ref.float().reshape(-1), D)
+    assert passed, f"biased output does not match the biased reference (B={B} S={S} causal={causal})"
+
+    # The bias must actually change the result: an unbiased run must NOT match the
+    # biased reference, otherwise a silently-dropped bias would pass the check above.
+    out_nb = flydsl_flash_attn_func(q, k, v, causal=causal, num_kv_heads=Hkv)
+    torch.cuda.synchronize()
+    assert (out_nb.float() - ref.float()).abs().max().item() > 1e-2, "bias had no effect on the output"
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("causal", [False, True])
+def test_bias_varlen(causal):
+    """Varlen bias is packed [total_q, max_seqlen_kv]: global q rows, batch-local key columns."""
+    dtype = torch.bfloat16
+    D, H, Hkv = 128, 8, 4
+    seqs = [512, 256, 384]
+    setup_seed(DEFAULT_SEED)
+    cu_list = [0]
+    for s in seqs:
+        cu_list.append(cu_list[-1] + s)
+    total, max_s = cu_list[-1], max(seqs)
+    cu = torch.tensor(cu_list, dtype=torch.int32, device="cuda")
+    q = torch.empty(total, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    k = torch.empty(total, Hkv, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    v = torch.empty(total, Hkv, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    bias = torch.empty(total, max_s, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+
+    out = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=causal,
+        num_kv_heads=Hkv,
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu,
+        max_seqlen_q=max_s,
+        max_seqlen_kv=max_s,
+        cross_seqlen=False,
+        bias=bias,
+    )
+    torch.cuda.synchronize()
+    for b, n in enumerate(seqs):
+        s0, s1 = cu_list[b], cu_list[b + 1]
+        ref = pytorch_ref_attention(
+            q[s0:s1].unsqueeze(0).float(),
+            k[s0:s1].unsqueeze(0).float(),
+            v[s0:s1].unsqueeze(0).float(),
+            causal=causal,
+            bias=bias[s0:s1, :n],
+        ).squeeze(0)
+        _, _, passed = _acc_metric(out[s0:s1].float().reshape(-1), ref.float().reshape(-1), D)
+        assert passed, f"varlen batch {b} (seqlen {n}, causal={causal}) does not match the biased reference"
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("kv_cache_layout", ["linear", "vectorized"])
+def test_bias_paged(causal, kv_cache_layout):
+    """Paged bias is [Sq, max_seqlen_kv]: q rows, batch-local logical key columns.
+
+    The block table only redirects the K/V fetch, so the bias column is still the
+    logical KV position -- the same index the causal mask already uses.
+    """
+    dtype = torch.bfloat16
+    B, Sq, H, Hkv, D = 2, 512, 8, 4, 128
+    # Uniform KV lengths: the dense paged path forwards only max_seqlen_kv, so ragged
+    # lengths are rejected outright (see test_bias_paged_rejects_ragged_seqlen_k).
+    kv_lens = [Sq, Sq]
+    max_kv = max(kv_lens)
+    setup_seed(DEFAULT_SEED)
+    q = torch.empty(B, Sq, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    kv_cache = _build_paged_kv_for_test(B, max_kv, 64, Hkv, D, kv_lens, dtype, "cuda", kv_cache_layout)
+    bias = torch.empty(Sq, max_kv, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+
+    paged_kw = dict(
+        causal=causal,
+        num_kv_heads=Hkv,
+        max_seqlen_kv=max_kv,
+        block_table=kv_cache["block_table"],
+        seqlen_k=kv_cache["seqlen_k"],
+        kv_cache_layout=kv_cache_layout,
+    )
+    out = flydsl_flash_attn_func(q, kv_cache["k_cache"], kv_cache["v_cache"], bias=bias, **paged_kw)
+    torch.cuda.synchronize()
+
+    for b, n in enumerate(kv_lens):
+        kb, vb = _logical_kv_from_pages(
+            kv_cache["k_cache"][_page_ids_for_batch(kv_cache, b)],
+            kv_cache["v_cache"][_page_ids_for_batch(kv_cache, b)],
+            kv_cache_layout,
+            n,
+        )
+        ref = pytorch_ref_attention(
+            q[b].unsqueeze(0).float(),
+            kb.unsqueeze(0).float(),
+            vb.unsqueeze(0).float(),
+            causal=causal,
+            bias=bias[:, :n],
+        ).squeeze(0)
+        _, _, passed = _acc_metric(out[b].float().reshape(-1), ref.float().reshape(-1), D)
+        assert passed, f"paged batch {b} ({kv_cache_layout}, causal={causal}) does not match the biased reference"
+
+    # A bias-free paged run must NOT match, so a silently-dropped bias cannot pass.
+    out_nb = flydsl_flash_attn_func(q, kv_cache["k_cache"], kv_cache["v_cache"], **paged_kw)
+    torch.cuda.synchronize()
+    assert (out_nb.float() - out.float()).abs().max().item() > 1e-2, "bias had no effect on the paged output"
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("causal", [False, True])
+def test_bias_paged_rejects_ragged_seqlen_k(causal):
+    """Dense paged bias rejects ragged per-batch seqlen_k instead of answering wrongly.
+
+    The dense paged launch reduces seqlen_k to a single max_seqlen_kv and never
+    forwards the per-batch lengths, so a shorter batch would attend KV slots it
+    does not own and mask against the wrong bottom-right offset.
+    """
+    dtype = torch.bfloat16
+    B, Sq, H, Hkv, D = 2, 512, 8, 4, 128
+    kv_lens = [256, 512]
+    max_kv = max(kv_lens)
+    setup_seed(DEFAULT_SEED)
+    q = torch.empty(B, Sq, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    ragged = _build_paged_kv_for_test(B, max_kv, 64, Hkv, D, kv_lens, dtype, "cuda", "linear")
+    bias = torch.empty(Sq, max_kv, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    paged_kw = dict(causal=causal, num_kv_heads=Hkv, max_seqlen_kv=max_kv, kv_cache_layout="linear")
+
+    with pytest.raises(NotImplementedError, match="uniform seqlen_k"):
+        flydsl_flash_attn_func(
+            q,
+            ragged["k_cache"],
+            ragged["v_cache"],
+            bias=bias,
+            block_table=ragged["block_table"],
+            seqlen_k=ragged["seqlen_k"],
+            **paged_kw,
+        )
+
+    # The guard is about raggedness alone: identical shapes with uniform lengths run.
+    uniform = _build_paged_kv_for_test(B, max_kv, 64, Hkv, D, [max_kv] * B, dtype, "cuda", "linear")
+    flydsl_flash_attn_func(
+        q,
+        uniform["k_cache"],
+        uniform["v_cache"],
+        bias=bias,
+        block_table=uniform["block_table"],
+        seqlen_k=uniform["seqlen_k"],
+        **paged_kw,
+    )
+    torch.cuda.synchronize()
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("causal", [False, True])
+def test_bias_paged_varlen_ragged_seqlen_k(causal):
+    """The varlen paged path -- what the dense rejection points callers at -- is correct.
+
+    cu_seqlens_kv carries the per-batch KV lengths into the kernel, so ragged
+    lengths mask and bottom-right-align per batch instead of against one global max.
+    """
+    dtype = torch.bfloat16
+    H, Hkv, D = 8, 4, 128
+    sq, skv = [512, 512], [256, 512]
+    setup_seed(DEFAULT_SEED)
+    cu_q = torch.tensor([0, sq[0], sum(sq)], dtype=torch.int32, device="cuda")
+    cu_kv = torch.tensor([0, skv[0], sum(skv)], dtype=torch.int32, device="cuda")
+    total_q, max_q, max_kv = sum(sq), max(sq), max(skv)
+    q = torch.empty(total_q, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    kv_cache = _build_paged_kv_for_test(len(sq), max_kv, 64, Hkv, D, skv, dtype, "cuda", "linear")
+    bias = torch.empty(total_q, max_kv, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+
+    out = flydsl_flash_attn_func(
+        q,
+        kv_cache["k_cache"],
+        kv_cache["v_cache"],
+        causal=causal,
+        num_kv_heads=Hkv,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_kv=cu_kv,
+        max_seqlen_q=max_q,
+        max_seqlen_kv=max_kv,
+        cross_seqlen=True,
+        block_table=kv_cache["block_table"],
+        seqlen_k=kv_cache["seqlen_k"],
+        kv_cache_layout="linear",
+        bias=bias,
+    )
+    torch.cuda.synchronize()
+
+    for b, n in enumerate(skv):
+        s0, s1 = int(cu_q[b]), int(cu_q[b + 1])
+        kb, vb = _logical_kv_from_pages(
+            kv_cache["k_cache"][_page_ids_for_batch(kv_cache, b)],
+            kv_cache["v_cache"][_page_ids_for_batch(kv_cache, b)],
+            "linear",
+            n,
+        )
+        ref = pytorch_ref_attention_qkv_diff(
+            q[s0:s1].unsqueeze(0).float(),
+            kb.unsqueeze(0).float(),
+            vb.unsqueeze(0).float(),
+            causal=causal,
+            bias=bias[s0:s1, :n],
+        ).squeeze(0)
+        _, _, passed = _acc_metric(out[s0:s1].float().reshape(-1), ref.float().reshape(-1), D)
+        assert passed, f"varlen paged batch {b} (Sq={sq[b]}, Skv={n}, causal={causal}) does not match"
+
+
+# ── attention bias: addressing limits ────────────────────────────────────────
+#
+# The kernel computes bias element offsets as `row * stride + column` in signed
+# i32 and describes the bias with a 32-bit-num_records buffer descriptor. A bias
+# past either limit is unrepresentable, so it must be rejected up front instead
+# of silently reading the wrong rows.
+
+# 2^31 elements at row 32768, and 4,295,098,368 bytes: over both limits at once.
+_OVERSIZED_BIAS_SHAPE = (32769, 65536)
+_OVERSIZED_BIAS_MATCH = "i32 bias element offsets"
+
+
+def _unbacked_bias(rows, cols, dtype=torch.bfloat16):
+    """A [rows, cols] bias with zero-stride storage: shape without the allocation."""
+    return torch.zeros(1, 1, dtype=dtype, device="cuda").expand(rows, cols)
+
+
+@pytest.mark.parametrize(
+    "rows,cols,elem_size,expect",
+    [
+        # The i32 element offset is the binding limit for the 2-byte bias dtypes.
+        (*_OVERSIZED_BIAS_SHAPE, 2, "i32 bias element offsets"),
+        (BIAS_MAX_OFFSET_ELEMS + 1, 1, 2, "i32 bias element offsets"),
+        (BIAS_MAX_OFFSET_ELEMS, 1, 2, None),  # exactly at the limit still fits
+        (46340, 46340, 2, None),  # ~4 GiB, the largest square bias that fits
+        (65536, 32768, 2, "i32 bias element offsets"),  # exactly 2^31 elements: one over
+        # A 4-byte element trips the descriptor limit while the offset still fits.
+        (BIAS_MAX_OFFSET_ELEMS, 1, 4, "bias buffer descriptor"),
+        (BIAS_MAX_DESCRIPTOR_BYTES // 4, 1, 4, None),
+    ],
+)
+def test_bias_addressing_error_limits(rows, cols, elem_size, expect):
+    why = bias_addressing_error(rows * cols, elem_size)
+    if expect is None:
+        assert why is None, f"bias {rows}x{cols} ({elem_size}B) should fit, got: {why}"
+    else:
+        assert why is not None, f"bias {rows}x{cols} ({elem_size}B) should be rejected"
+        assert expect in why, f"unexpected reason for {rows}x{cols} ({elem_size}B): {why}"
+
+
+def test_bias_dense_rejects_unaddressable():
+    dtype = torch.bfloat16
+    B, S, H, D = 1, 128, 4, 128
+    q = torch.zeros(B, S, H, D, dtype=dtype, device="cuda")
+    bias = _unbacked_bias(*_OVERSIZED_BIAS_SHAPE, dtype=dtype)
+    with pytest.raises(ValueError, match=_OVERSIZED_BIAS_MATCH):
+        flydsl_flash_attn_func(q, q.clone(), q.clone(), causal=False, num_kv_heads=H, bias=bias)
+
+
+def test_bias_varlen_rejects_unaddressable():
+    dtype = torch.bfloat16
+    seqs = [128, 128]
+    total, max_s = sum(seqs), max(seqs)
+    H, Hkv, D = 4, 4, 128
+    cu = torch.tensor([0, seqs[0], total], dtype=torch.int32, device="cuda")
+    q = torch.zeros(total, H, D, dtype=dtype, device="cuda")
+    kv = torch.zeros(total, Hkv, D, dtype=dtype, device="cuda")
+    bias = _unbacked_bias(*_OVERSIZED_BIAS_SHAPE, dtype=dtype)
+    with pytest.raises(ValueError, match=_OVERSIZED_BIAS_MATCH):
+        flydsl_flash_attn_func(
+            q,
+            kv,
+            kv.clone(),
+            causal=False,
+            num_kv_heads=Hkv,
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu,
+            max_seqlen_q=max_s,
+            max_seqlen_kv=max_s,
+            cross_seqlen=False,
+            bias=bias,
+        )
+
+
+@_requires_gfx950
+def test_bias_varlen_self_attn_rejects_narrow_bias():
+    """Varlen self-attention bounds bias columns by max_seqlen_q, not max_seqlen_kv.
+
+    max_seqlen_kv is legitimately None when cross_seqlen=False, so a too-narrow
+    bias used to pass validation: the kernel then indexes key column j with
+    bias_stride0 = bias.shape[1], reading the following bias rows instead of failing.
+    """
+    dtype = torch.bfloat16
+    seqs = [512, 384]
+    total, max_s = sum(seqs), max(seqs)
+    H, Hkv, D = 8, 4, 128
+    setup_seed(DEFAULT_SEED)
+    cu = torch.tensor([0, seqs[0], total], dtype=torch.int32, device="cuda")
+    q = torch.empty(total, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    k = torch.empty(total, Hkv, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    v = torch.empty(total, Hkv, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    self_attn_kw = dict(
+        causal=False,
+        num_kv_heads=Hkv,
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu,
+        max_seqlen_q=max_s,
+        cross_seqlen=False,
+    )
+
+    for cols in (1, max_s - 1):
+        narrow = torch.zeros(total, cols, dtype=dtype, device="cuda")
+        with pytest.raises(ValueError, match="self-attention KV maximum"):
+            flydsl_flash_attn_func(q, k, v, bias=narrow, **self_attn_kw)
+
+    # A bias exactly at the bound still runs, and matches the per-batch reference.
+    bias = torch.empty(total, max_s, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    out = flydsl_flash_attn_func(q, k, v, bias=bias, **self_attn_kw)
+    torch.cuda.synchronize()
+    for b, n in enumerate(seqs):
+        s0, s1 = int(cu[b]), int(cu[b + 1])
+        ref = pytorch_ref_attention(
+            q[s0:s1].unsqueeze(0).float(),
+            k[s0:s1].unsqueeze(0).float(),
+            v[s0:s1].unsqueeze(0).float(),
+            causal=False,
+            bias=bias[s0:s1, :n],
+        ).squeeze(0)
+        _, _, passed = _acc_metric(out[s0:s1].float().reshape(-1), ref.float().reshape(-1), D)
+        assert passed, f"varlen self-attention batch {b} (seqlen {n}) does not match the biased reference"
+
+
+def test_bias_paged_rejects_unaddressable():
+    dtype = torch.bfloat16
+    B, Sq, H, Hkv, D = 1, 128, 4, 4, 128
+    q = torch.zeros(B, Sq, H, D, dtype=dtype, device="cuda")
+    kv_cache = _build_paged_kv_for_test(B, Sq, 64, Hkv, D, [Sq], dtype, "cuda", "linear")
+    bias = _unbacked_bias(*_OVERSIZED_BIAS_SHAPE, dtype=dtype)
+    with pytest.raises(ValueError, match=_OVERSIZED_BIAS_MATCH):
+        flydsl_flash_attn_func(
+            q,
+            kv_cache["k_cache"],
+            kv_cache["v_cache"],
+            causal=True,
+            num_kv_heads=Hkv,
+            max_seqlen_kv=Sq,
+            block_table=kv_cache["block_table"],
+            seqlen_k=kv_cache["seqlen_k"],
+            kv_cache_layout="linear",
+            bias=bias,
+        )
+
+
+def test_precompute_paged_bias_reaches_inputs_and_reference():
+    """`--block-table --bias` must generate a bias AND fold it into the reference.
+
+    The helper used to ignore use_bias, so the paged benchmark ran unbiased and
+    compared against an unbiased reference: a PASS that measured nothing.
+    """
+    kw = dict(
+        batch=1,
+        seqlen_q=256,
+        seqlen_kv=None,
+        varlen_seqlens_q=None,
+        varlen_seqlens_kv=None,
+        num_heads=4,
+        head_dim=128,
+        num_kv_heads=4,
+        dtype=torch.bfloat16,
+        causal=False,
+        seed=DEFAULT_SEED,
+        page_size=64,
+        kv_cache_layout="linear",
+    )
+    biased_inputs, biased_ref, biased_status = _precompute_paged_kv_inputs_and_ref(**kw, use_bias=True)
+    plain_inputs, plain_ref, plain_status = _precompute_paged_kv_inputs_and_ref(**kw)
+    assert biased_status is None and plain_status is None
+    assert biased_inputs["bias"] is not None, "use_bias=True must generate a paged bias"
+    assert plain_inputs["bias"] is None, "use_bias defaults to no bias"
+
+    # The bias is drawn after Q/K/V, so the same seed leaves the inputs identical
+    # and any reference difference is the bias alone.
+    for key in ("q_t", "k_t", "v_t"):
+        assert torch.equal(biased_inputs[key], plain_inputs[key]), f"{key} must not depend on use_bias"
+    assert (
+        biased_ref.float() - plain_ref.float()
+    ).abs().max().item() > 1e-2, "the paged reference must fold in the generated bias"
+
+
+@_requires_gfx950
+def test_bias_launcher_rejects_unaddressable():
+    """The kernel launcher guards too, for callers that bypass flydsl_flash_attn_func.
+
+    The guard also has to fire before the launcher's ``bias.contiguous()``, which
+    would otherwise materialize gigabytes on the way to a guaranteed failure.
+    """
+    dtype = torch.bfloat16
+    B, S, H, D = 1, 384, 4, 128
+    launch = build_flash_attn_dualwave_swp_module(num_heads=H, head_dim=D, causal=False, has_bias=True)
+    q, k, v, o = (torch.zeros(B, S, H, D, dtype=dtype, device="cuda") for _ in range(4))
+    bias = _unbacked_bias(*_OVERSIZED_BIAS_SHAPE, dtype=dtype)
+    free_before = torch.cuda.mem_get_info()[0]
+    with pytest.raises(ValueError, match=_OVERSIZED_BIAS_MATCH):
+        launch(q, k, v, o, B, S, bias=bias)
+    assert torch.cuda.mem_get_info()[0] > free_before - 2**30, "rejected bias must not be materialized"
+
+
+# ── ALiBi ────────────────────────────────────────────────────────────────────
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("two_d", [False, True])
+@pytest.mark.parametrize("B,S,H,Hkv,D", [(2, 512, 8, 8, 128), (1, 384, 8, 4, 64)])
+def test_alibi_dense(causal, two_d, B, S, H, Hkv, D):
+    """score += -slope * |i + Skv - Sq - j|; slopes are [H] or [B, H] (alibi_stride_b)."""
+    dtype = torch.bfloat16
+    setup_seed(DEFAULT_SEED)
+    q = torch.empty(B, S, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    k = torch.empty(B, S, Hkv, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    v = torch.empty(B, S, Hkv, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    slopes = make_alibi_slopes(B, H, two_d)
+    assert slopes.shape == ((B, H) if two_d else (H,))
+
+    out = flydsl_flash_attn_func(q, k, v, causal=causal, num_kv_heads=Hkv, alibi_slopes=slopes)
+    torch.cuda.synchronize()
+    ref = pytorch_ref_attention(q.float(), k.float(), v.float(), causal=causal, alibi_slopes=slopes)
+    _, _, passed = _acc_metric(out.float().reshape(-1), ref.float().reshape(-1), D)
+    assert passed, f"ALiBi output does not match the reference (B={B} S={S} two_d={two_d} causal={causal})"
+
+    # Without slopes the result must differ, else a dropped ALiBi term would pass above.
+    out_nb = flydsl_flash_attn_func(q, k, v, causal=causal, num_kv_heads=Hkv)
+    torch.cuda.synchronize()
+    assert (out_nb.float() - ref.float()).abs().max().item() > 1e-2, "ALiBi had no effect on the output"
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("causal", [False, True])
+def test_alibi_varlen(causal):
+    """ALiBi positions are within-sequence: no packed-token base, per-batch lengths."""
+    dtype = torch.bfloat16
+    D, H, Hkv = 128, 8, 4
+    seqs = [512, 256, 384]
+    setup_seed(DEFAULT_SEED)
+    cu_list = [0]
+    for s in seqs:
+        cu_list.append(cu_list[-1] + s)
+    total, max_s = cu_list[-1], max(seqs)
+    cu = torch.tensor(cu_list, dtype=torch.int32, device="cuda")
+    q = torch.empty(total, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    k = torch.empty(total, Hkv, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    v = torch.empty(total, Hkv, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    slopes = make_alibi_slopes(len(seqs), H, two_d=True)
+
+    out = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=causal,
+        num_kv_heads=Hkv,
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu,
+        max_seqlen_q=max_s,
+        max_seqlen_kv=max_s,
+        cross_seqlen=False,
+        alibi_slopes=slopes,
+    )
+    torch.cuda.synchronize()
+    for b, n in enumerate(seqs):
+        s0, s1 = cu_list[b], cu_list[b + 1]
+        ref = pytorch_ref_attention(
+            q[s0:s1].unsqueeze(0).float(),
+            k[s0:s1].unsqueeze(0).float(),
+            v[s0:s1].unsqueeze(0).float(),
+            causal=causal,
+            alibi_slopes=slopes[b],
+        ).squeeze(0)
+        _, _, passed = _acc_metric(out[s0:s1].float().reshape(-1), ref.float().reshape(-1), D)
+        assert passed, f"varlen batch {b} (seqlen {n}, causal={causal}) does not match the ALiBi reference"
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("causal", [False, True])
+def test_alibi_and_bias_combined(causal):
+    """ALiBi and bias are independent score terms and must both land."""
+    dtype = torch.bfloat16
+    B, S, H, D = 1, 512, 8, 128
+    setup_seed(DEFAULT_SEED)
+    q = torch.empty(B, S, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    k = torch.empty(B, S, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    v = torch.empty(B, S, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    bias = torch.empty(S, S, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    slopes = make_alibi_slopes(B, H)
+
+    out = flydsl_flash_attn_func(q, k, v, causal=causal, bias=bias, alibi_slopes=slopes)
+    torch.cuda.synchronize()
+    qf, kf, vf = q.float(), k.float(), v.float()
+    ref_both = pytorch_ref_attention(qf, kf, vf, causal=causal, bias=bias, alibi_slopes=slopes)
+    _, _, passed = _acc_metric(out.float().reshape(-1), ref_both.float().reshape(-1), D)
+    assert passed, "combined bias+ALiBi output does not match the combined reference"
+
+    # Neither term alone explains the output.
+    ref_alibi = pytorch_ref_attention(qf, kf, vf, causal=causal, alibi_slopes=slopes)
+    ref_bias = pytorch_ref_attention(qf, kf, vf, causal=causal, bias=bias)
+    assert (out.float() - ref_alibi.float()).abs().max().item() > 1e-2, "bias term missing"
+    assert (out.float() - ref_bias.float()).abs().max().item() > 1e-2, "ALiBi term missing"
+
+
 def test_lse_fully_masked_rows():
     """Cross-attention causal with Skv < Sq: leading query rows see no keys -> -inf."""
     dtype = torch.bfloat16
@@ -3441,6 +4448,103 @@ def test_lse_fully_masked_rows():
     ref = _reference_lse(q, k, True, H)
     assert (~torch.isfinite(ref)).any(), "test setup should produce fully-masked rows"
     _assert_lse_matches(lse, ref, _ATOL_BF16)
+
+
+@pytest.mark.parametrize("lazy_rescale, atol", [(True, 0.06), (False, 0.05)])
+@pytest.mark.parametrize("S", [1024, 12288])
+@pytest.mark.parametrize("k_scale", [1.0, 200.0])
+def test_fp8_softmax_normalises(S, k_scale, lazy_rescale, atol):
+    """With V all ones the output is exactly 1.0, because softmax normalises.
+
+    Nothing about V or the PV product can move it, and 1.0 is representable in
+    e4m3, so any deviation is the softmax's own normalisation. `k_scale` widens
+    the score range: the failure this guards against is invisible on
+    near-uniform attention and severe on peaked attention.
+
+    Both rescale paths are checked, with different bounds, because the headroom
+    for lifting P differs. The lazy path leaves ``exp2`` free to reach
+    ``2**RESCALE_THRESHOLD`` and can use only the remainder, so it improves
+    without becoming exact; the eager path rebases every tile and gets all of
+    it. Before the fix these reached 0.64 and 0.50 respectively. The lazy bound
+    also pins the per-length threshold: pinned at 6 the widest case here reaches
+    0.09, and at bf16's 8 it reaches 0.23, both past the 0.06 allowed.
+    """
+    if get_rocm_arch() != "gfx950":
+        pytest.skip("dense fp8 attention is gfx950-only")
+
+    B, H, D = 2, 8, 128
+    torch.manual_seed(0)
+    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1 * k_scale
+
+    fp8 = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8).max
+    q_s = q.abs().amax().float() / fp8_max
+    k_s = k.abs().amax().float() / fp8_max
+    v_s = torch.tensor(1.0 / fp8_max, device="cuda")
+    v = (torch.ones(B, S, H, D, device="cuda", dtype=torch.bfloat16) / v_s).to(fp8)
+
+    out = flydsl_flash_attn_func(
+        (q / q_s).to(fp8),
+        (k / k_s).to(fp8),
+        v,
+        causal=False,
+        q_descale=q_s.reshape(1).contiguous(),
+        k_descale=k_s.reshape(1).contiguous(),
+        v_descale=v_s.reshape(1).contiguous(),
+        dualwave_swp_lazy_rescale=lazy_rescale,
+    )
+    if isinstance(out, (tuple, list)):
+        out = out[0]
+    out = out.float()
+
+    # e4m3 rounding of P leaves a per-row residue that the lift cannot remove.
+    torch.testing.assert_close(out, torch.ones_like(out), rtol=0, atol=atol)
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_fp8_out_tensor_is_filled_and_returned(monkeypatch, split):
+    """A caller-supplied ``out`` must come back filled, and be the same tensor.
+
+    ``split=True`` lowers the overflow bound so the batch-splitting path runs on
+    a small tensor: reaching it for real needs 2**31 elements, i.e. ~10 GB of
+    q/k/v/out, which is why it must be reachable another way to be covered at
+    all. Each launch writes into its own ``out[i:i+1]`` view, so returning a
+    concatenation would both copy several GB at the sizes that reach it and hand
+    back a different tensor than the caller passed. Splitting must also leave
+    the result unchanged, which is what comparing against the unsplit reference
+    checks.
+    """
+    if get_rocm_arch() != "gfx950":
+        pytest.skip("dense fp8 attention is gfx950-only")
+
+    B, S, H, D = 2, 1024, 8, 128
+    torch.manual_seed(0)
+    fp8 = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8).max
+    q, k, v = (torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1 for _ in range(3))
+    scales = [t.abs().amax().float() / fp8_max for t in (q, k, v)]
+    qq, kq, vq = ((t / s).to(fp8) for t, s in zip((q, k, v), scales))
+    descales = [s.reshape(1).contiguous() for s in scales]
+
+    ref = flydsl_flash_attn_func(
+        qq, kq, vq, causal=False, q_descale=descales[0], k_descale=descales[1], v_descale=descales[2]
+    )
+    if isinstance(ref, (tuple, list)):
+        ref = ref[0]
+
+    if split:
+        monkeypatch.setattr(flash_attn_interface, "_FP8_MAX_FLAT_ELEMS", qq.numel())
+
+    out = torch.empty(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    got = flydsl_flash_attn_func(
+        qq, kq, vq, causal=False, q_descale=descales[0], k_descale=descales[1], v_descale=descales[2], out=out
+    )
+    if isinstance(got, (tuple, list)):
+        got = got[0]
+
+    assert got.data_ptr() == out.data_ptr(), "out was not returned to the caller"
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
 
 def test_return_lse_false_returns_only_out():
@@ -3471,5 +4575,800 @@ def test_return_lse_rejects_fp8():
         )
 
 
+@_requires_gfx950
+@pytest.mark.parametrize("H", [8, 16, 32, 64])
+def test_xcd_swizzle_is_bit_identical(H):
+    """The head-slow remap must not change a single bit of the output.
+
+    It only re-derives (head, q_block) from the same linear workgroup id, so it
+    is bijective by construction -- but a mistake in the derivation would show
+    up as a permuted or partially-recomputed output rather than as an error, so
+    this pins it. S clears the auto-dispatch threshold (num_q_blocks >= 64 at
+    BLOCK_M=256) so both settings run on the shapes the remap targets.
+    """
+    S = 64 * 256
+    dtype = torch.bfloat16
+    torch.manual_seed(H)
+    q = _rand_lse(1, S, H, 128, dtype=dtype)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+
+    def run(flag):
+        return flydsl_flash_attn_func(q, k, v, causal=False, dualwave_swp_xcd_swizzle=flag).clone()
+
+    off, on = run(False), run(True)
+    torch.cuda.synchronize()
+    assert torch.equal(off, on)
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("xcd_swizzle", [None, True])
+def test_xcd_swizzle_heads_not_multiple_of_xcd(xcd_swizzle):
+    """H % 8 != 0 must fall back rather than mis-map, however the flag is set.
+
+    The remap divides the linear workgroup id by the q-block count to recover
+    the head, which only lands each head on one XCD when the head count divides
+    evenly into the 8 XCDs. Two guards enforce that: the dispatch condition
+    below auto-selects against it, and _init_dualwave_thread_mapping re-checks
+    NUM_HEADS_Q % NUM_XCD_GFX950 independently -- so forcing the flag on is safe
+    and simply does not engage the remap. Both paths are checked here.
+    """
+    S, H = 64 * 256, 12
+    dtype = torch.bfloat16
+    torch.manual_seed(H)
+    q = _rand_lse(1, S, H, 128, dtype=dtype)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+
+    out = flydsl_flash_attn_func(q, k, v, causal=False, dualwave_swp_xcd_swizzle=xcd_swizzle)
+    torch.cuda.synchronize()
+    ref = F.scaled_dot_product_attention(
+        q.transpose(1, 2).float(), k.transpose(1, 2).float(), v.transpose(1, 2).float()
+    ).transpose(1, 2)
+    torch.testing.assert_close(out.float(), ref, atol=_ATOL_BF16, rtol=0)
+
+
 if __name__ == "__main__":
     main()
+
+
+# ── attention sink ───────────────────────────────────────────────────────────
+
+
+def _sink_for(q, k, causal, share=DEFAULT_SINK_SHARE):
+    return calibrate_sink(*_rows_logsumexp(q, k, causal), share)
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("share", [0.25, 0.9])
+@pytest.mark.parametrize("B,S,H,Hkv,D", [(1, 512, 8, 8, 128), (2, 384, 8, 4, 64)])
+def test_sink_dense(causal, share, B, S, H, Hkv, D):
+    """One extra softmax denominator logit per head, with no matching V row."""
+    dtype = torch.bfloat16
+    setup_seed(DEFAULT_SEED)
+    q = torch.empty(B, S, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    k = torch.empty(B, S, Hkv, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    v = torch.empty(B, S, Hkv, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    sink = _sink_for(q, k, causal, share)
+    assert sink.shape == (H,) and sink.dtype == torch.float32
+
+    out = flydsl_flash_attn_func(q, k, v, causal=causal, num_kv_heads=Hkv, sink=sink)
+    torch.cuda.synchronize()
+    ref = pytorch_ref_attention(q.float(), k.float(), v.float(), causal=causal, sink=sink)
+    _, _, passed = _acc_metric(out.float().reshape(-1), ref.float().reshape(-1), D)
+    assert passed, f"sink output does not match the reference (B={B} S={S} share={share} causal={causal})"
+
+    # Calibration is what makes this test meaningful: with the sink dropped the
+    # result must visibly differ. An uncalibrated sink near 0 would not.
+    out_ns = flydsl_flash_attn_func(q, k, v, causal=causal, num_kv_heads=Hkv)
+    torch.cuda.synchronize()
+    assert (out_ns.float() - ref.float()).abs().max().item() > 1e-2, "sink had no effect on the output"
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("causal", [False, True])
+def test_sink_varlen(causal):
+    dtype = torch.bfloat16
+    D, H, Hkv = 128, 8, 4
+    seqs = [512, 256, 384]
+    setup_seed(DEFAULT_SEED)
+    cu_list = [0]
+    for s in seqs:
+        cu_list.append(cu_list[-1] + s)
+    total, max_s = cu_list[-1], max(seqs)
+    cu = torch.tensor(cu_list, dtype=torch.int32, device="cuda")
+    q = torch.empty(total, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    k = torch.empty(total, Hkv, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    v = torch.empty(total, Hkv, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    # One [H] table shared by every sequence, calibrated over all their rows.
+    tot, cnt = torch.zeros(H, dtype=torch.float32, device="cuda"), 0
+    for b in range(len(seqs)):
+        s0, s1 = cu_list[b], cu_list[b + 1]
+        sl, n = _rows_logsumexp(q[s0:s1].unsqueeze(0), k[s0:s1].unsqueeze(0), causal)
+        tot += sl
+        cnt += n
+    sink = calibrate_sink(tot, cnt, DEFAULT_SINK_SHARE)
+
+    out = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=causal,
+        num_kv_heads=Hkv,
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu,
+        max_seqlen_q=max_s,
+        max_seqlen_kv=max_s,
+        cross_seqlen=False,
+        sink=sink,
+    )
+    torch.cuda.synchronize()
+    for b, n in enumerate(seqs):
+        s0, s1 = cu_list[b], cu_list[b + 1]
+        ref = pytorch_ref_attention(
+            q[s0:s1].unsqueeze(0).float(),
+            k[s0:s1].unsqueeze(0).float(),
+            v[s0:s1].unsqueeze(0).float(),
+            causal=causal,
+            sink=sink,
+        ).squeeze(0)
+        _, _, passed = _acc_metric(out[s0:s1].float().reshape(-1), ref.float().reshape(-1), D)
+        assert passed, f"varlen batch {b} (seqlen {n}, causal={causal}) does not match the sink reference"
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("num_kv_splits", [2, 3, 4])
+def test_sink_splitk_counted_once(num_kv_splits):
+    """Split-K writes sink-free partials and folds the sink in once, in the combine.
+
+    LSE is the sharp signal: it is the log denominator, so a sink counted
+    num_kv_splits times (or zero times) shows up directly instead of being
+    normalized away as it is in O.
+    """
+    dtype = torch.bfloat16
+    B, S, H, D = 1, 2048, 8, 128
+    setup_seed(DEFAULT_SEED)
+    q = torch.empty(B, S, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    k = torch.empty(B, S, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    v = torch.empty(B, S, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    sink = _sink_for(q, k, True)
+
+    out1, lse1 = flydsl_flash_attn_func(q, k, v, causal=True, sink=sink, return_lse=True)
+    outk, lsek = flydsl_flash_attn_func(q, k, v, causal=True, sink=sink, num_kv_splits=num_kv_splits, return_lse=True)
+    torch.cuda.synchronize()
+    # Split-K must agree with the single-split result it is meant to reproduce.
+    assert (lsek - lse1).abs().max().item() < 2e-2, f"split-K LSE diverges at {num_kv_splits} splits"
+    _, _, passed = _acc_metric(outk.float().reshape(-1), out1.float().reshape(-1), D)
+    assert passed, f"split-K output diverges at {num_kv_splits} splits"
+
+    # A sink counted once per split would shift LSE by ~ln(num_kv_splits); assert
+    # we are nowhere near that, so the test cannot pass on a double-count.
+    assert (lsek - lse1).abs().max().item() < 0.5 * math.log(num_kv_splits)
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("Sq,Skv", [(512, 4096), (4096, 512)])
+@pytest.mark.parametrize("causal", [False, True])
+def test_splitk_rejects_cross_length_kv(Sq, Skv, causal):
+    """Dense split-K is self-attention only, and it used to fail without saying so."""
+    dtype = torch.bfloat16
+    B, H, D = 1, 8, 128
+    setup_seed(DEFAULT_SEED)
+    q = torch.empty(B, Sq, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    k = torch.empty(B, Skv, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    v = torch.empty(B, Skv, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    with pytest.raises(ValueError, match="seq_len_kv == seq_len_q"):
+        flydsl_flash_attn_func(q, k, v, causal=causal, num_kv_splits=4)
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("Sq,Skv", [(512, 128), (512, 160)])
+def test_sink_lse_cross_attn_skipped_blocks(Sq, Skv):
+    """Causal cross-attention with Skv < Sq skips whole q blocks that see no key.
+
+    A skipped block never reaches the main body's fold_sink, so the skip path has
+    to write those rows' LSE itself: it is the per-head sink, not -inf and not
+    whatever the caller's output buffer happened to hold. Skv=160 also puts some
+    all-masked rows inside an active block, covering both paths at once.
+    """
+    dtype = torch.bfloat16
+    B, H, D = 2, 8, 128
+    setup_seed(DEFAULT_SEED)
+    q = torch.empty(B, Sq, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    k = torch.empty(B, Skv, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    v = torch.empty(B, Skv, H, D, dtype=dtype, device="cuda").uniform_(*UNIFORM_RANGE)
+    sink = _sink_for(q, k, True)
+
+    out, lse = flydsl_flash_attn_func(q, k, v, causal=True, sink=sink, return_lse=True)
+    torch.cuda.synchronize()
+
+    # Sink-inclusive LSE = ln(exp(LSE_no_sink) + exp(sink)); -inf rows collapse to sink.
+    lse_ref_ns = _reference_lse(q, k, True, H)  # B, H, Sq
+    assert bool((~torch.isfinite(lse_ref_ns)).any()), "test setup should produce fully-masked q rows"
+    lse_ref = torch.logaddexp(lse_ref_ns, sink.view(1, H, 1).expand_as(lse_ref_ns))
+    diff = (lse.float() - lse_ref).abs().max().item()
+    assert diff <= _ATOL_BF16, f"sink-inclusive LSE max abs diff {diff:.3e} exceeds atol {_ATOL_BF16:.3e}"
+
+    # The all-masked rows are the regression: their whole denominator is the sink.
+    n_masked = Sq - Skv
+    masked_lse = lse[:, :, :n_masked].float()
+    assert (masked_lse - sink.view(1, H, 1)).abs().max().item() <= 1e-4, "all-masked rows must carry the sink LSE"
+    assert out[:, :n_masked].abs().max().item() == 0.0, "all-masked rows must have zero output"
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("k_scale", [8.0, 32.0, 64.0])
+def test_lazy_rescale_survives_a_wide_score_range(k_scale):
+    """A widened logit spread must not break the lazy rescale.
+
+    Every other test here uses near-uniform attention, which never reaches the
+    branch. The eager path is the reference; the two are mathematically the same.
+    """
+    B, S, H, D = 1, 4096, 8, 128
+    torch.manual_seed(0)
+    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    k = (torch.randn_like(q).float() * k_scale).to(torch.bfloat16)
+    v = torch.randn_like(q)
+
+    lazy = flydsl_flash_attn_func(q, k, v, causal=False)
+    eager = flydsl_flash_attn_func(q, k, v, causal=False, dualwave_swp_lazy_rescale=False)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(eager).all(), f"the eager baseline is not finite at k_scale={k_scale}"
+    n_nan = int(torch.isnan(lazy).sum())
+    n_inf = int(torch.isinf(lazy).sum())
+    assert torch.isfinite(
+        lazy
+    ).all(), f"lazy rescale produced {n_nan} NaN and {n_inf} inf of {lazy.numel()} at k_scale={k_scale}"
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2).float(), k.transpose(1, 2).float(), v.transpose(1, 2).float()
+    ).transpose(1, 2)
+    rel = lambda o: ((o.float() - ref).norm() / ref.norm()).item()  # noqa: E731
+    assert (
+        rel(lazy) <= rel(eager) * 1.05 + 1e-4
+    ), f"lazy rel L2 {rel(lazy):.3e} is worse than eager {rel(eager):.3e} at k_scale={k_scale}"
+
+
+@_requires_gfx950
+def test_fp8_lazy_rescale_keeps_the_running_max_monotonic():
+    """Successive downward rebases must not multiply into an overflow.
+
+    One row class reads a coordinate whose tile maxima descend, the other one that
+    ascends and so fires the wave-uniform branch every tile. V is all ones, so the
+    exact output is 1.0; the unfixed kernel returns 1,048,576 of 2,097,152 as NaN.
+    """
+    B, S, H, D = 1, 2048, 8, 128
+    BLOCK_N, STEP = 64, 32.0
+    fp8 = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8).max
+
+    q = torch.zeros(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    q[:, 0::2, :, 0] = 1.0
+    q[:, 1::2, :, 1] = 1.0
+    tile = torch.arange(S, device="cuda") // BLOCK_N
+    k = torch.zeros(B, S, H, D, device="cuda", dtype=torch.float32)
+    k[:, :, :, 0] = (-STEP * tile).view(1, S, 1)
+    k[:, :, :, 1] = (STEP * tile).view(1, S, 1)
+    k = k.to(torch.bfloat16)
+
+    q_s = torch.tensor(1.0 / fp8_max, device="cuda")
+    k_s = k.abs().amax().float() / fp8_max
+    v_s = torch.tensor(1.0 / fp8_max, device="cuda")
+    v = (torch.ones(B, S, H, D, device="cuda", dtype=torch.bfloat16) / v_s).to(fp8)
+
+    out = flydsl_flash_attn_func(
+        (q / q_s).to(fp8),
+        (k / k_s).to(fp8),
+        v,
+        causal=False,
+        q_descale=q_s.reshape(1).contiguous(),
+        k_descale=k_s.reshape(1).contiguous(),
+        v_descale=v_s.reshape(1).contiguous(),
+        dualwave_swp_lazy_rescale=True,
+        num_kv_splits=1,
+    )
+    out = (out[0] if isinstance(out, (tuple, list)) else out).float()
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all(), f"{int(torch.isnan(out).sum())} NaN of {out.numel()}"
+    assert (out - 1).abs().max().item() < 0.01, f"max |o-1| = {(out - 1).abs().max().item():.4f}"
+
+
+@pytest.mark.l0_backend_agnostic
+def test_fp8_lazy_paths_do_not_roll_their_own_correction():
+    """The fp8 lazy rescales must not compute their own correction factor.
+
+    A per-step cap does not bound the product over many tiles, so the invariant is
+    structural: the correction comes from ``rescale_from_tile_max``.
+    """
+    from kernels.attention import flash_attn_utils as _fau
+
+    src = Path(_fau.__file__).read_text().splitlines()
+    start = next(i for i, ln in enumerate(src) if "class DualwaveFp8SoftmaxHelper" in ln)
+    end = next((i for i, ln in enumerate(src[start + 1 :], start + 1) if ln.startswith("class ")), len(src))
+    body = src[start:end]
+
+    def method(name):
+        i = next(k for k, ln in enumerate(body) if f"def {name}(" in ln)
+        stop = next((k for k in range(i + 1, len(body)) if body[k].startswith("    def ")), len(body))
+        return "\n".join(body[i:stop])
+
+    for name in ("lazy_rescale_o", "lazy_correct_o"):
+        chunk = method(name)
+        assert "exp2" not in chunk, f"{name} computes its own correction instead of taking the monotonic one"
+        assert "_lazy_correction" in chunk or "rescale_from_tile_max" in chunk, f"{name} has no correction source"
+    assert "rescale_from_tile_max" in method("_lazy_correction"), "the shared correction is not the monotonic one"
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("case", ["b1_too_large", "per_slice_still_too_large", "kv_only_over_limit"])
+def test_fp8_flat_overflow_guard_covers_every_tensor(monkeypatch, case):
+    """The int32 flat-dim guard has to see K and V, and to give up loudly.
+
+    Splitting divides the flat dim by B, so it only helps while B > 1 and while
+    one entry fits. Cross-attention can also put the excess in K/V rather than
+    Q. Each case lowers the bound rather than allocating 2**31 elements.
+    """
+    torch.manual_seed(0)
+    fp8 = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8).max
+    H, D = 8, 128
+
+    def quant(t):
+        s = t.abs().amax().float() / fp8_max
+        return (t / s).to(fp8), s.reshape(1).contiguous()
+
+    B, Sq, Skv = (1, 1024, 1024) if case == "b1_too_large" else (2, 1024, 1024)
+    if case == "kv_only_over_limit":
+        Sq = 256
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    k = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    v = torch.randn_like(k)
+    qq, qs = quant(q)
+    kq, ks = quant(k)
+    vq, vs = quant(v)
+    kw = dict(causal=False, q_descale=qs, k_descale=ks, v_descale=vs)
+
+    if case == "kv_only_over_limit":
+        # Between q's count and k's, so only the K/V check can fire. B=2 splits.
+        ref = flydsl_flash_attn_func(qq, kq, vq, **kw)
+        ref = ref[0] if isinstance(ref, (tuple, list)) else ref
+        monkeypatch.setattr(flash_attn_interface, "_FP8_MAX_FLAT_ELEMS", kq.numel())
+        got = flydsl_flash_attn_func(qq, kq, vq, **kw)
+        got = got[0] if isinstance(got, (tuple, list)) else got
+        torch.testing.assert_close(got.float(), ref.float(), rtol=0, atol=0)
+        return
+
+    # b1_too_large has no batch to divide; per_slice_still_too_large has B=2 but
+    # a bound low enough that one entry is still over, so the recursion hits the
+    # same wall. Both must raise rather than launch.
+    bound = qq.numel() if case == "b1_too_large" else qq.numel() // 2
+    monkeypatch.setattr(flash_attn_interface, "_FP8_MAX_FLAT_ELEMS", bound)
+    with pytest.raises(NotImplementedError, match="int32"):
+        flydsl_flash_attn_func(qq, kq, vq, **kw)
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("modifier", ["bias", "alibi_slopes", "sink"])
+def test_fp8_split_still_rejects_modifiers(monkeypatch, modifier):
+    """The flat-dim split must not swallow an unsupported modifier.
+
+    It runs before the fp8 modifier check and does not forward bias, alibi or
+    sink, so a call large enough to split used to return plain attention while
+    the same call one element smaller raised.
+    """
+    B, S, H, D = 2, 256, 8, 128
+    monkeypatch.setattr(flash_attn_interface, "_FP8_MAX_FLAT_ELEMS", B * S * H * D // 2)
+    fp8 = torch.float8_e4m3fn
+    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16).to(fp8)
+    k, v = q.clone(), q.clone()
+    scale = torch.ones(1, device="cuda")
+    kw = dict(causal=False, q_descale=scale, k_descale=scale, v_descale=scale)
+    arg = {
+        "bias": torch.zeros(S, S, device="cuda", dtype=torch.bfloat16),
+        "alibi_slopes": torch.zeros(H, device="cuda", dtype=torch.float32),
+        "sink": torch.zeros(H, device="cuda", dtype=torch.float32),
+    }[modifier]
+    with pytest.raises(NotImplementedError, match=f"{modifier} is not supported for fp8"):
+        flydsl_flash_attn_func(q, k, v, **{modifier: arg}, **kw)
+
+
+@_requires_gfx950
+def test_fp8_split_result_survives_a_non_current_stream(monkeypatch):
+    """The split must not be consumed on a stream that is not the one it ran on.
+
+    Every launch goes to ``stream``; building the result on the ambient stream
+    reads it while those kernels are still queued, and the damage survives a
+    later synchronize because the copy already happened.
+    """
+    B, S, H, D = 2, 512, 8, 128
+    fp8 = torch.float8_e4m3fn
+    torch.manual_seed(0)
+    q = (torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1).to(fp8)
+    k, v = q.clone(), q.clone()
+    scale = torch.ones(1, device="cuda")
+    kw = dict(causal=False, q_descale=scale, k_descale=scale, v_descale=scale)
+
+    ref = flydsl_flash_attn_func(q, k, v, **kw)
+    torch.cuda.synchronize()
+
+    # over the whole tensor, under one batch entry, so it splits and each launch fits
+    monkeypatch.setattr(flash_attn_interface, "_FP8_MAX_FLAT_ELEMS", B * S * H * D * 3 // 4)
+    side = torch.cuda.Stream()
+    filler = torch.randn(4096, 4096, device="cuda")
+    with torch.cuda.stream(side):
+        for _ in range(20):  # keep the stream busy so the attention starts late
+            filler = filler @ filler.T
+    got = flydsl_flash_attn_func(q, k, v, stream=side, **kw)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(got.float(), ref.float(), rtol=0, atol=0)
+
+
+def test_fp8_rescale_threshold_drops_past_the_long_sequence_bound():
+    """fp8 picks its rescale threshold from the KV length.
+
+    Below the bound 6 and 4 are equally accurate and 6 is cheaper; above it the
+    running max spans enough tiles that 4's extra two log2 units of P lift are
+    worth its ~0.3%. The kernel is not specialised on S, so this widens the
+    build cache to two variants -- keep it two.
+    """
+    f = flash_attn_interface._fp8_rescale_threshold
+    assert f(1024) == 6.0
+    assert f(flash_attn_interface._FP8_LONG_SEQ) == 6.0
+    assert f(flash_attn_interface._FP8_LONG_SEQ + 1) == 4.0
+    assert f(131072) == 4.0
+    assert set(f(s) for s in (1, 1024, 4096, 4097, 8192, 131072)) == {6.0, 4.0}
+
+
+@_requires_gfx950
+def test_fp8_default_is_the_lazy_rescale():
+    """Every other fp8 case passes the flag, so the default would go untested.
+
+    V is all ones, so the exact output is 1.0 and the two runs must also agree
+    bit for bit.
+    """
+    B, S, H, D = 1, 4096, 8, 128
+    fp8 = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8).max
+    torch.manual_seed(0)
+    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1 * 200.0
+    q_s = q.abs().amax().float() / fp8_max
+    k_s = k.abs().amax().float() / fp8_max
+    v_s = torch.tensor(1.0 / fp8_max, device="cuda")
+    v = (torch.ones(B, S, H, D, device="cuda", dtype=torch.bfloat16) / v_s).to(fp8)
+    kw = dict(
+        causal=False,
+        q_descale=q_s.reshape(1).contiguous(),
+        k_descale=k_s.reshape(1).contiguous(),
+        v_descale=v_s.reshape(1).contiguous(),
+        num_kv_splits=1,
+    )
+    qq, kk = (q / q_s).to(fp8), (k / k_s).to(fp8)
+
+    default = flydsl_flash_attn_func(qq, kk, v, **kw)
+    lazy = flydsl_flash_attn_func(qq, kk, v, dualwave_swp_lazy_rescale=True, **kw)
+    torch.cuda.synchronize()
+    default = (default[0] if isinstance(default, (tuple, list)) else default).float()
+    lazy = (lazy[0] if isinstance(lazy, (tuple, list)) else lazy).float()
+
+    torch.testing.assert_close(default, lazy, rtol=0, atol=0)
+
+
+_FP8_HEADS = 12
+_FP8_D, _FP8_DV = 192, 128
+
+
+def _assert_fp8_shape(causal, batch=1, seq_len=1, head_dim=_FP8_D, head_dim_v=_FP8_DV, num_heads=_FP8_HEADS, **kwargs):
+    """Correctness-only run of one fp8 shape, asserted against the fp8 gate.
+
+    bench=False keeps the profiler and timing loop out of the unit run; the
+    benchmark numbers for these shapes come from the CLI harness.
+    """
+    r = run_fp8_config(
+        batch,
+        seq_len,
+        num_heads,
+        head_dim,
+        causal,
+        warmup=0,
+        iters=1,
+        verbose=False,
+        bench=False,
+        head_dim_v=head_dim_v,
+        **kwargs,
+    )
+    assert "err" not in r, r["err"]
+    assert r["passed"], (
+        f"fp8 gate: max_err={r['max_err']:.3e} (< {FP8_MAX_ERR}), " f"min_cos={r['min_cos']:.5f} (> {FP8_MIN_COS})"
+    )
+
+
+FP8_SPLIT_MODES = [pytest.param(1, id="dense"), pytest.param(None, id="autosplit")]
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("batch,seq_len", [(1, 4096), (2, 4096), (3, 4096), (4, 4096), (1, 8192)])
+@pytest.mark.parametrize("num_kv_splits", FP8_SPLIT_MODES)
+def test_fp8_head_dim_192_v_128_dense(causal, batch, seq_len, num_kv_splits):
+    """Dense self-attention with QK head_dim 192 and a 128-wide V.
+
+    Q/K are [B, S, 12, 192], V is [B, S, 12, 128], and the output follows V.
+    """
+    _assert_fp8_shape(causal, batch=batch, seq_len=seq_len, num_kv_splits=num_kv_splits)
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("batch", FP8_VARLEN_BATCHES)
+@pytest.mark.parametrize("num_kv_splits", FP8_SPLIT_MODES)
+def test_fp8_head_dim_192_v_128_varlen(causal, batch, num_kv_splits):
+    """Packed varlen self-attention over 2614 tokens, batch 1..4.
+
+    Q/K are [2614, 12, 192] and V is [2614, 12, 128] at every batch -- only the
+    cu_seqlens partition changes (batch 2 is [0, 1024, 2614]). Q and KV share the
+    per-sequence lengths, so only the V head dim differs here.
+    """
+    _assert_fp8_shape(causal, varlen_seqlens_q=FP8_VARLEN_Q_SEQLENS[batch], num_kv_splits=num_kv_splits)
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("batch", FP8_VARLEN_BATCHES)
+@pytest.mark.parametrize("num_kv_splits", FP8_SPLIT_MODES)
+def test_fp8_head_dim_192_v_128_varlen_cross_length(causal, batch, num_kv_splits):
+    """Packed varlen cross-attention, batch 1..4: 2614 Q tokens vs 16384 KV tokens."""
+    _assert_fp8_shape(
+        causal,
+        varlen_seqlens_q=FP8_VARLEN_Q_SEQLENS[batch],
+        varlen_seqlens_kv=FP8_VARLEN_KV_SEQLENS[batch],
+        num_kv_splits=num_kv_splits,
+    )
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_kv_splits", FP8_SPLITKV_SPLITS)
+@pytest.mark.parametrize("head_dim,head_dim_v", [(128, 128), (192, 128)])
+def test_fp8_split_kv(causal, num_kv_splits, head_dim, head_dim_v):
+    """fp8 split-KV: the KV dimension split across workgroups plus a combine pass.
+
+    The 128/128 pair isolates the split from the new head-dim pair, so a failure
+    points at one feature or the other rather than both at once.
+    """
+    _assert_fp8_shape(
+        causal,
+        batch=1,
+        seq_len=8192,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        num_kv_splits=num_kv_splits,
+    )
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("batch", (1, 2, 3, 4))
+def test_fp8_split_kv_batched(causal, batch):
+    """Split-KV over batches: the grid is B * num_kv_splits deep, so the batch is
+    what decides whether splitting still fills the GPU."""
+    _assert_fp8_shape(causal, batch=batch, seq_len=8192, num_kv_splits=4)
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("seq_len,seqlen_kv,num_kv_splits", [(512, 16384, 8), (2614, 16384, 8), (1024, 32768, 16)])
+def test_fp8_split_kv_cross_length(causal, seq_len, seqlen_kv, num_kv_splits):
+    """Split-KV with short Q against long KV -- the shape split-KV exists for."""
+    _assert_fp8_shape(causal, batch=1, seq_len=seq_len, seqlen_kv=seqlen_kv, num_kv_splits=num_kv_splits)
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("seq_len,num_kv_splits", list(zip(FP8_SPLITKV_SEQLENS, FP8_SPLITKV_SPLITS)))
+def test_fp8_split_kv_long_sequence(causal, seq_len, num_kv_splits):
+    """Split count scaled with the KV length, 4k/2 through 32k/16."""
+    _assert_fp8_shape(causal, batch=1, seq_len=seq_len, num_kv_splits=num_kv_splits)
+
+
+def _run_fp8_into_nan_out(q, k, v, head_dim_v, **kwargs):
+    """Launch fp8 attention into a NaN-filled ``out`` so unwritten rows are countable."""
+    fp8 = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8).max
+    scales = [t.abs().amax().float().clamp(min=1e-12) / fp8_max for t in (q, k, v)]
+    qq, kq, vq = ((t.float() / s).to(fp8).contiguous() for t, s in zip((q, k, v), scales))
+    descales = [s.reshape(1).contiguous() for s in scales]
+    out = torch.full(q.shape[:-1] + (head_dim_v,), float("nan"), device=q.device, dtype=torch.bfloat16)
+    flydsl_flash_attn_func(
+        qq,
+        kq,
+        vq,
+        out=out,
+        q_descale=descales[0],
+        k_descale=descales[1],
+        v_descale=descales[2],
+        **kwargs,
+    )
+    return out
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("batch,seq_len,num_heads", [(1, 4097, 1), (1, 4097, 3), (1, 2050, 7), (1, 8193, 1)])
+def test_fp8_auto_split_kv_writes_every_row(batch, seq_len, num_heads):
+    """Auto split-K must not drop the tail of the combine grid."""
+    D = 128
+    assert (batch * num_heads * seq_len) % (256 // (D // 4)) != 0, "shape would not exercise the tail"
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(batch, seq_len, num_heads, D, device="cuda", dtype=torch.bfloat16) * 0.1 for _ in range(3))
+    out = _run_fp8_into_nan_out(q, k, v, D, causal=False, num_kv_heads=num_heads)
+    assert not torch.isnan(out).any(), f"{int(torch.isnan(out).any(-1).sum())} output rows were never written"
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("seq_len,num_heads,head_dim_v", [(385, 1, 128), (385, 3, 128), (1155, 1, 128), (386, 1, 64)])
+def test_fp8_varlen_split_kv_respects_batch_boundaries(seq_len, num_heads, head_dim_v):
+    """varlen + split-K must not mix batches inside a combine wave."""
+    rows_per_wave = 256 // head_dim_v
+    assert (seq_len * num_heads) % rows_per_wave != 0, "shape would not straddle a wave"
+    B, D = 8, 192
+    torch.manual_seed(0)
+    cu = torch.arange(0, (B + 1) * seq_len, seq_len, device="cuda", dtype=torch.int32)
+    total = B * seq_len
+    q = torch.randn(total, num_heads, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    k = torch.randn(total, num_heads, D, device="cuda", dtype=torch.bfloat16) * 0.1
+    v = torch.randn(total, num_heads, head_dim_v, device="cuda", dtype=torch.bfloat16) * 0.1
+    kw = dict(
+        causal=False,
+        num_kv_heads=num_heads,
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu,
+        max_seqlen_q=seq_len,
+        max_seqlen_kv=seq_len,
+        cross_seqlen=False,
+    )
+    split = _run_fp8_into_nan_out(q, k, v, head_dim_v, num_kv_splits=2, **kw)
+    assert not torch.isnan(split).any(), f"{int(torch.isnan(split).any(-1).sum())} output rows were never written"
+    unsplit = _run_fp8_into_nan_out(q, k, v, head_dim_v, num_kv_splits=1, **kw)
+    torch.testing.assert_close(split.float(), unsplit.float(), rtol=2e-2, atol=2e-2)
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("head_dim_v", [64, 96, 128, 160, 192])
+def test_fp8_supported_v_head_dims_run(head_dim_v):
+    """Every head_dim_v the guard admits has to actually produce the right answer."""
+    _assert_fp8_shape(False, batch=1, seq_len=512, num_heads=4, head_dim=128, head_dim_v=head_dim_v)
+
+
+@_requires_gfx950
+@pytest.mark.parametrize(
+    "head_dim,head_dim_v,match",
+    [
+        # D_CHUNKS < 2 aborts LLVM; D_CHUNKS > 6 miscomputes the high chunks.
+        (128, 32, "head_dim_v"),
+        (128, 224, "head_dim_v"),
+        (128, 256, "head_dim_v"),
+        (96, 96, "head_dim"),
+        (256, 192, "LDS"),
+        (320, 128, "LDS"),
+        (384, 64, "LDS"),
+    ],
+)
+def test_fp8_rejected_head_dims_raise_before_launch(head_dim, head_dim_v, match):
+    """Unsupported head dims must name the shape, not abort or fault the GPU."""
+    B, S, H = 1, 512, 4
+    torch.manual_seed(0)
+    q = torch.randn(B, S, H, head_dim, device="cuda", dtype=torch.bfloat16) * 0.1
+    k = torch.randn(B, S, H, head_dim, device="cuda", dtype=torch.bfloat16) * 0.1
+    v = torch.randn(B, S, H, head_dim_v, device="cuda", dtype=torch.bfloat16) * 0.1
+    with pytest.raises((RuntimeError, ValueError), match=match):
+        _run_fp8_into_nan_out(q, k, v, head_dim_v, causal=False, num_kv_heads=H)
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("seq_len", [1, 385, 1000, 4097])
+def test_fp8_dense_ragged_seq_lens(seq_len):
+    """Dense fp8 on sequence lengths that are not multiples of the tile."""
+    _assert_fp8_shape(True, batch=2, seq_len=seq_len, num_heads=4, head_dim=192, head_dim_v=128)
+
+
+_NUM_CU = 256
+
+
+@pytest.mark.parametrize(
+    "batch,num_heads,seqlen_q,seqlen_kv,causal,expect",
+    [
+        (1, 8, 512, 512, True, 128),
+        (1, 8, 2048, 2048, True, 128),
+        (1, 8, 2048, 2048, False, 128),
+        (8, 32, 2048, 2048, True, 256),
+        (16, 32, 1024, 1024, True, 256),
+        (32, 32, 512, 512, True, 256),
+        (1, 8, 2048, 2048, True, 128),
+        (1, 8, 4096, 4096, True, 256),
+        (1, 8, 4096, 16384, True, 256),
+        (2, 8, 4096, 4096, True, 256),
+    ],
+)
+def test_fp8_auto_block_m_picks(batch, num_heads, seqlen_q, seqlen_kv, causal, expect):
+    """Pin what `_fp8_auto_block_m` chooses; correctness tests pass either way."""
+    got = flash_attn_interface._fp8_auto_block_m(batch, num_heads, seqlen_q, seqlen_kv, causal, _NUM_CU)
+    assert got == expect
+
+
+def test_fp8_auto_block_m_rule_does_not_depend_on_causal():
+    """The two mask modes share one rule; splitting them is what regressed before."""
+    for batch in (1, 2, 4, 8, 16, 32):
+        for num_heads in (8, 16, 32):
+            for seqlen in (512, 1024, 2048, 4096):
+                assert flash_attn_interface._fp8_auto_block_m(
+                    batch, num_heads, seqlen, seqlen, True, _NUM_CU
+                ) == flash_attn_interface._fp8_auto_block_m(batch, num_heads, seqlen, seqlen, False, _NUM_CU)
+
+
+@pytest.mark.parametrize(
+    "batch,num_heads,seqlen,causal,expect",
+    [
+        (1, 8, 512, False, 1),
+        (1, 8, 4096, False, 2),
+        (32, 32, 8192, False, 1),
+    ],
+)
+def test_fp8_auto_kv_splits_picks(batch, num_heads, seqlen, causal, expect):
+    got = flash_attn_interface._fp8_auto_kv_splits(batch, num_heads, seqlen, seqlen, causal, _NUM_CU)
+    assert got == expect
+
+
+@pytest.mark.parametrize(
+    "batch,causal,cross,num_kv_splits,expect",
+    [
+        (2, True, False, 1, 2),
+        (3, True, False, 1, 1),
+        (2, False, False, 1, 1),
+        (2, True, True, 1, 1),
+        (2, True, False, 4, 1),
+    ],
+)
+def test_fp8_batch_interleave_group_picks(batch, causal, cross, num_kv_splits, expect):
+    got = flash_attn_interface._fp8_batch_interleave_group(batch, causal, cross, num_kv_splits)
+    assert got == expect
+
+
+def test_fp8_num_kv_splits_none_is_auto_and_one_is_off(monkeypatch):
+    """``None`` opts into the autotuner; an explicit ``1`` keeps the kernel unsplit."""
+    if get_rocm_arch() != "gfx950":
+        pytest.skip("dense fp8 attention is gfx950-only")
+    seen = []
+    orig = flash_attn_interface._build_dense_fp8
+
+    def spy(**kw):
+        seen.append(kw["num_kv_splits"])
+        return orig(**kw)
+
+    monkeypatch.setattr(flash_attn_interface, "_build_dense_fp8", spy)
+    B, S, H, D = 1, 8192, 2, 128
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) * 0.1 for _ in range(3))
+    for kwargs in ({}, {"num_kv_splits": 1}, {"num_kv_splits": 4}):
+        _run_fp8_into_nan_out(q, k, v, D, causal=True, num_kv_heads=H, **kwargs)
+    auto, off, pinned = seen
+    assert auto > 1, "the default should reach the autotuner"
+    assert off == 1, "an explicit num_kv_splits=1 must stay unsplit"
+    assert pinned == 4
+
+
+@_requires_gfx950
+@pytest.mark.parametrize("seq_len,num_heads,head_dim", [(4097, 1, 128), (2050, 7, 128), (1025, 1, 64)])
+def test_bf16_split_kv_writes_every_row(seq_len, num_heads, head_dim):
+    """The bf16 combine grid shares the fp8 one's rounding, and the same bug."""
+    B = 1
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(B, seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16) * 0.1 for _ in range(3)
+    )
+    out = torch.full_like(q, float("nan"))
+    flydsl_flash_attn_func(q, k, v, causal=False, num_kv_heads=num_heads, out=out, num_kv_splits=2)
+    assert not torch.isnan(out).any(), f"{int(torch.isnan(out).any(-1).sum())} output rows were never written"
+    unsplit = flydsl_flash_attn_func(q, k, v, causal=False, num_kv_heads=num_heads, num_kv_splits=1)
+    if isinstance(unsplit, (tuple, list)):
+        unsplit = unsplit[0]
+    torch.testing.assert_close(out.float(), unsplit.float(), rtol=2e-3, atol=2e-3)
